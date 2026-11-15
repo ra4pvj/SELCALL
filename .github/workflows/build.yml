@@ -216,6 +216,13 @@ jobs:
           **Linux** x86_64 (Ubuntu 22.04+, Debian 12+ …): HFSelcall-Linux-x64.tar.gz; нужна libportaudio2 (sudo apt install libportaudio2).
 
           selcall-cli-macOS.zip — консольный кодер/декодер для macOS."
+          # отозванные релизы (список в .github/retracted-releases.txt) удаляются вместе с тегами
+          grep -vE '^\s*(#|$)' .github/retracted-releases.txt 2>/dev/null | while read -r old; do
+            if gh release view "$old" -R "$REPO" >/dev/null 2>&1; then
+              echo "Удаляю отозванный релиз $old"
+              gh release delete "$old" -R "$REPO" --yes --cleanup-tag
+            fi
+          done
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             TAG="${GITHUB_REF#refs/tags/}"
             gh release create "$TAG" dist/* -R "$REPO" --title "HF Selcall $TAG" --notes "$NOTES"
