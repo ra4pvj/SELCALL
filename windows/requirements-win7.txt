@@ -1,4 +1,4 @@
-# Версии, совместимые с Python 3.8 — последним Python для Windows 7 SP1.
+# Versions compatible with Python 3.8 - the last Python for Windows 7 SP1.
 numpy==1.24.4
 sounddevice==0.4.6
 pyserial==3.5
