@@ -387,6 +387,17 @@ struct SettingsView: View {
                         Spacer()
                         Stepper(String(format: "%.0f с", m.ringSeconds), value: $m.ringSeconds, in: 5...300, step: 5)
                     }
+                    Toggle("Звонок в эфир — ответ вызывающей станции (как CODAN / Vertex)", isOn: $m.ringOnAir)
+                    if m.ringOnAir {
+                        HStack {
+                            Text("Повторов в эфир")
+                            Spacer()
+                            Stepper("\(m.ringOnAirRepeats)", value: $m.ringOnAirRepeats, in: 1...10)
+                        }
+                        Text("Через 1 с после принятого вызова включается PTT и звонок передаётся на выход трансивера "
+                             + "с уровнем передачи. На подтверждения (ACK) не отвечает.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     Text(m.monitorDevices.isEmpty ? "Звонок звучит на системном выходе Mac."
                                                   : "Звонок звучит на устройствах самоконтроля.")
                         .font(.caption).foregroundStyle(.secondary)

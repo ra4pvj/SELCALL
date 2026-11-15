@@ -76,6 +76,7 @@ DEFAULTS = dict(
     ptt_delay=0.5, ptt_tail=0.3, mute_rx_on_tx=True,
     mon_devs=[], mon_rx=True, mon_tx=True, mon_level=0.5,
     ring=True, ring_style="codan", ring_volume=0.5, ring_seconds=30.0,
+    ring_air=True, ring_air_repeats=3,
 )
 
 PTT_TITLES = {"none": "нет (VOX / внешний PTT)", "RTS": "RTS", "DTR": "DTR", "RTS+DTR": "RTS + DTR",
@@ -565,6 +566,22 @@ class Core:
             self._play_next()
         return None
 
+    def send_ring(self, to_id):
+        """Ответный звонок в эфир (как CODAN / Vertex): N повторов звонкового сигнала с PTT."""
+        if sd is None:
+            return "Звуковая библиотека недоступна: %s" % SD_ERROR
+        dev = device_index(self.s["out_dev"], "out")
+        fs = output_rate(dev)
+        one = ring_pattern(self.s["ring_style"], fs, float(self.s["tx_level"]))
+        n = max(1, int(self.s.get("ring_air_repeats") or 3))
+        lead = np.zeros(int(float(self.s["ptt_delay"]) * fs), dtype=np.float32)
+        tail = np.zeros(int(float(self.s["ptt_tail"]) * fs), dtype=np.float32)
+        audio = np.concatenate([lead] + [one] * n + [tail]).astype(np.float32)
+        self.tx_queue.append((audio, fs, dev, digits(self.s["my_id"]), digits(to_id), "", "Звонок в эфир"))
+        if not self.transmitting:
+            self._play_next()
+        return None
+
     def _play_next(self):
         if not self.tx_queue:
             self._finish_tx()
@@ -918,6 +935,15 @@ class App:
             pass
         if self.core.s["ring"]:
             self.core.ring()
+        if self.core.s.get("ring_air"):
+            # небольшая пауза: вызывающая станция успевает перейти на приём
+            frm = c["from"]
+
+            def air():
+                err = self.core.send_ring(frm)
+                if err:
+                    self.add(err, "error")
+            self.root.after(1000, air)
 
     def answer_ring(self):
         if self.incoming:
@@ -1000,7 +1026,7 @@ class App:
                 elif k == "tx":
                     _, me, to, text, title, dur = ev
                     line = "▲ %s  %s → %s" % (title, me, to) + (("  «%s»" % text) if text else "")
-                    self.add(line, "tx", "%.1f с · ACK-RQ" % dur)
+                    self.add(line, "tx", ("%.1f с · ACK-RQ" % dur) if title in ("Вызов", "Сообщение") else ("%.1f с" % dur))
                     self.v["status"].set("Передача…")
                     self.btn_abort.pack(side="left")
                 elif k == "tx_done":
@@ -1076,6 +1102,8 @@ class SettingsWindow:
             ring=tk.BooleanVar(value=s["ring"]),
             ring_style=tk.StringVar(value=dict(RING_STYLES).get(s["ring_style"], RING_STYLES[0][1])),
             ring_vol=tk.DoubleVar(value=s["ring_volume"]), ring_sec=tk.DoubleVar(value=s["ring_seconds"]),
+            ring_air=tk.BooleanVar(value=s.get("ring_air", True)),
+            ring_air_n=tk.IntVar(value=int(s.get("ring_air_repeats", 3))),
         )
         v = self.v
 
@@ -1167,6 +1195,10 @@ class SettingsWindow:
         ttk.Button(f, text="Прослушать", command=self.test_ring).grid(row=2, column=2, **pad)
         ttk.Label(f, text="Не дольше, с").grid(row=3, column=0, **pad)
         ttk.Spinbox(f, from_=5, to=300, increment=5, textvariable=v["ring_sec"], width=6).grid(row=3, column=1, **pad)
+        ttk.Checkbutton(f, text="Звонок в эфир — ответ вызывающей станции\n(как CODAN / Vertex; с PTT, уровень передачи)",
+                        variable=v["ring_air"]).grid(row=4, column=0, columnspan=3, **pad)
+        ttk.Label(f, text="Повторов в эфир").grid(row=5, column=0, **pad)
+        ttk.Spinbox(f, from_=1, to=10, increment=1, textvariable=v["ring_air_n"], width=6).grid(row=5, column=1, **pad)
 
         b = ttk.Frame(w, padding=(10, 8))
         b.grid(row=4, column=0, columnspan=2, sticky="ew")
@@ -1222,6 +1254,8 @@ class SettingsWindow:
         s["ring_style"] = next((k for k, t in RING_STYLES if t == v["ring_style"].get()), "codan")
         s["ring_volume"] = self._num(v["ring_vol"], 0.05, 1.0, 0.5)
         s["ring_seconds"] = self._num(v["ring_sec"], 5, 300, 30)
+        s["ring_air"] = bool(v["ring_air"].get())
+        s["ring_air_repeats"] = int(self._num(v["ring_air_n"], 1, 10, 3))
         self.app.core.save()
         err = self.app.core.reopen_ptt()
         if err:
@@ -1304,6 +1338,16 @@ def selftest(out_path):
     log("input channel auto-select + peak level: %s (channel %d, level %.2f)" % (
         "OK" if good else "FAIL", c.active_channel, c.level))
     ok = ok and good
+    c2 = Core.__new__(Core)
+    c2.s = dict(DEFAULTS)
+    c2.tx_queue, c2.transmitting = [], True          # не запускать воспроизведение в самотесте
+    if sd is not None:
+        c2.send_ring("1111")
+        a = c2.tx_queue[0][0] if c2.tx_queue else np.zeros(0)
+        fs_ = c2.tx_queue[0][1] if c2.tx_queue else 48000
+        good = len(a) / fs_ > 3 * 1.7 and abs(float(np.abs(a).max()) - DEFAULTS["tx_level"]) < 0.01
+        log("ring on air (3 x codan, TX level): %s (%.1f s)" % ("OK" if good else "FAIL", len(a) / fs_))
+        ok = ok and good
     pat = ring_pattern("codan", 48000, 0.5)
     log("ring pattern: %s" % ("OK" if len(pat) > 0 and np.abs(pat).max() <= 0.51 else "FAIL"))
     cat = [PTT.command_bytes("ICOM", True, 0x94), PTT.command_bytes("YAESU", True),
