@@ -1,0 +1,162 @@
+name: Build macOS + Windows and release
+
+# main  -> пересобирается пре-релиз "latest"
+# тег v* -> постоянный релиз с этим номером (git tag v0.3.0 && git push origin v0.3.0)
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          swift --version
+
+      - name: Build universal app (arm64 + x86_64) and run self-test
+        run: UNIVERSAL=1 ./scripts/build-app.sh
+
+      - name: Python reference self-test
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install --quiet numpy
+          .venv/bin/python python/selcall.py selftest
+
+      - name: Package
+        run: |
+          mkdir -p out
+          cp build/HFSelcall.zip out/HFSelcall-macOS.zip
+          (cd build && zip -q ../out/selcall-cli-macOS.zip selcall-cli)
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: macos
+          path: out/*
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            boot: Windows-64bit-intel
+          - arch: x86
+            boot: Windows-32bit-intel
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # Python 3.8 — последняя версия с поддержкой Windows 7 SP1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.8.10"
+          architecture: ${{ matrix.arch }}
+
+      - name: Dependencies (Win7-compatible versions)
+        run: |
+          python -VV
+          python -m pip install --upgrade "pip<25"
+          python -m pip install -r windows/requirements-win7.txt "pyinstaller==5.13.2" "pyinstaller-hooks-contrib<2025" pefile
+
+      - name: Version
+        run: |
+          $v = git describe --tags --always
+          "VERSION = '$v'" | Out-File -Encoding ascii windows/_version.py
+          "Version: $v"
+
+      - name: Self-test from source (codec + Windows app)
+        run: |
+          python python/selcall.py selftest
+          python windows/hfselcall_win.py --selftest
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Windows 7 compatibility scan (DLL/PYD/bootloader imports)
+        run: |
+          $base = python -c "import sys; print(sys.base_prefix)"
+          $np = python -c "import numpy, os; print(os.path.dirname(numpy.__file__))"
+          $sdd = python -c "import _sounddevice_data, os; print(os.path.dirname(_sounddevice_data.__file__))"
+          $boot = python -c "import PyInstaller, os; print(os.path.join(os.path.dirname(PyInstaller.__file__), 'bootloader', '${{ matrix.boot }}'))"
+          python windows/check_win7.py "$base\python38.dll" "$base\DLLs" $np $sdd $boot
+
+      - name: Build exe (PyInstaller 5.13, UCRT bundled for Win7 without KB2999226)
+        working-directory: windows
+        run: |
+          $ucrt = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Redist" -Recurse -Directory -Filter ${{ matrix.arch }} |
+                  Where-Object { $_.FullName -match '\\ucrt\\DLLs\\' } | Sort-Object FullName | Select-Object -Last 1
+          if (-not $ucrt) { throw "UCRT redistributable not found" }
+          "UCRT: $($ucrt.FullName)  ($((Get-ChildItem "$($ucrt.FullName)\*.dll").Count) dll)"
+          python -m PyInstaller --noconfirm --onefile --windowed --name HFSelcall `
+            --paths ..\python --collect-all sounddevice --collect-all _sounddevice_data `
+            --add-binary "$($ucrt.FullName)\*.dll;." `
+            hfselcall_win.py
+
+      - name: Self-test of the built exe
+        working-directory: windows
+        run: |
+          $p = Start-Process -FilePath dist\HFSelcall.exe -ArgumentList "--selftest" -Wait -PassThru
+          Get-Content dist\selftest.txt
+          if ($p.ExitCode -ne 0) { throw "exe self-test failed ($($p.ExitCode))" }
+          Remove-Item dist\selftest.txt
+
+      - name: Package
+        run: |
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item windows\dist\HFSelcall.exe out\
+          Copy-Item windows\README_WINDOWS.txt out\
+          Compress-Archive -Path out\HFSelcall.exe, out\README_WINDOWS.txt -DestinationPath "HFSelcall-Windows-${{ matrix.arch }}.zip"
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: windows-${{ matrix.arch }}
+          path: HFSelcall-Windows-${{ matrix.arch }}.zip
+          if-no-files-found: error
+
+  release:
+    needs: [macos, windows]
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          ls -la dist
+          NOTES="Сборка ${GITHUB_SHA::7}.
+
+          **macOS 13+** (Apple Silicon и Intel): HFSelcall-macOS.zip → перенесите «HF Selcall.app» в «Программы». Приложение не нотаризовано: первый запуск — правый клик → «Открыть».
+
+          **Windows 7 SP1 / 8 / 10 / 11**: HFSelcall-Windows-x64.zip (64-бит) или HFSelcall-Windows-x86.zip (32-бит; для 32-битной Windows 7). Распакуйте и запустите HFSelcall.exe, установка не нужна. На Windows 7 должно стоять обновление KB2533623 (обычно уже есть). SmartScreen: «Подробнее» → «Выполнить в любом случае».
+
+          selcall-cli-macOS.zip — консольный кодер/декодер для macOS."
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+            gh release create "$TAG" dist/* -R "$REPO" --title "HF Selcall $TAG" --notes "$NOTES"
+          else
+            gh release delete latest -R "$REPO" --yes --cleanup-tag || true
+            gh release create latest dist/* -R "$REPO" --target "$GITHUB_SHA" --prerelease \
+              --title "HF Selcall (последняя сборка ${GITHUB_SHA::7})" --notes "$NOTES"
+          fi

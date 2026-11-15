@@ -1,6 +1,6 @@
 # HF Selcall
 
-Приложение для macOS для приёма и передачи КВ‑селкола **CCIR 493‑4**, совместимого с трансиверами CODAN (а также Barrett, Q‑MAC, Vertex). Работает через звуковую карту, к которой подключён трансивер.
+Приложение для macOS и Windows (7 SP1 и новее) для приёма и передачи КВ‑селкола **CCIR 493‑4**, совместимого с трансиверами CODAN (а также Barrett, Q‑MAC, Vertex). Работает через звуковую карту, к которой подключён трансивер.
 
 Поддерживаются:
 - **Selcall**: индивидуальный вызов, 4‑ или 6‑значные ID;
@@ -8,6 +8,15 @@
 - **звонок** при вызове на свой ID: повторяющиеся сигналы, как у трансиверов CODAN / Vertex Standard, и баннер «Ответить / Сбросить»;
 - **управление передачей (PTT)**: VOX или линии RTS/DTR COM‑порта, задержка PTT → сигнал и хвост, как в HF Pager;
 - отключаемая **пауза приёма на время передачи**, чтобы не декодировать собственный сигнал.
+
+## Скачать
+
+Готовые сборки — в [Releases](https://github.com/ra4pvj/SELCALL/releases): постоянные релизы `vX.Y.Z` и пре‑релиз `latest` (последняя сборка из `main`).
+
+- `HFSelcall-macOS.zip` — macOS 13+, Apple Silicon и Intel;
+- `HFSelcall-Windows-x64.zip` / `HFSelcall-Windows-x86.zip` — Windows 7 SP1 … 11, один exe без установки (см. `windows/README_WINDOWS.txt`).
+
+Сборки делает GitHub Actions (`.github/workflows/build.yml`). Windows‑версия собирается под Windows 7: Python 3.8.10, numpy 1.24.4, sounddevice 0.4.6, PyInstaller 5.13.2. UCRT встроен в exe. Каждый раз сборка проверяется самотестом готового exe и сканированием всех DLL/PYD и загрузчика на функции Windows 8+ (`windows/check_win7.py`). Чтобы выпустить релиз: `git tag v0.3.0 && git push origin v0.3.0`.
 
 ## Сборка
 
@@ -52,7 +61,8 @@ open "build/HF Selcall.app"
 | `Sources/SelcallCore` | кодек: модуляция FSK, кадр CCIR 493‑4, декодер, АПЧ, потоковый приёмник, WAV, передискретизация |
 | `Sources/HFSelcall` | приложение SwiftUI, звук через AVAudioEngine и CoreAudio |
 | `Sources/selcall-cli` | консольная утилита: `encode`, `decode`, `selftest` |
-| `python/selcall.py` | эталонная реализация на Python (numpy), на ней проверялся алгоритм |
+| `python/selcall.py` | кодек на Python (numpy): эталон алгоритма и ядро Windows‑версии |
+| `windows/` | приложение для Windows (tkinter, sounddevice, pyserial), сборка и проверка совместимости с Win7 |
 
 ```bash
 swift run selcall-cli encode --to 1234 --from 5678 --msg "PRIVET 73" -o msg.wav

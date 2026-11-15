@@ -211,7 +211,7 @@ public enum Selcall {
     /// короткой (6 RX, CODAN), и для полной (8 RX, M.493) фазировки.
     static func findCalls(bits: [UInt8]) -> [Found] {
         let N = bits.count
-        guard N >= 400 else { return [] }
+        guard N >= 200 else { return [] }
         let M = N - 9
         var sym = [Int16](repeating: -1, count: M)
         for n in 0..<M {
@@ -334,7 +334,7 @@ public enum Selcall {
         for k in 0..<8 {
             let ph = Double(k) * spb / 8
             let count = Int((Double(d.count) - ph) / spb)
-            guard count >= 400 else { continue }
+            guard count >= 200 else { continue }
             var idx = [Int](repeating: 0, count: count)
             var raw = [UInt8](repeating: 0, count: count)
             for j in 0..<count {

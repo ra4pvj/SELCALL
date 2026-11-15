@@ -1,0 +1,1155 @@
+#!/usr/bin/env python3
+"""
+HF Selcall для Windows (7 SP1 и новее): приём/передача CCIR 493-4 селкола, совместимого с CODAN.
+Тот же функционал, что у версии для macOS: Selcall и Message call, АПЧ, журнал, звонок при
+вызове на свой ID, управление передачей (VOX или RTS/DTR COM-порта), пауза приёма на время передачи.
+
+Совместимо с Python 3.8 (последний с поддержкой Windows 7): numpy, sounddevice, pyserial, tkinter.
+    python hfselcall_win.py            — запуск
+    python hfselcall_win.py --selftest — самопроверка (результат в selftest.txt рядом с exe)
+"""
+import datetime
+import json
+import os
+import queue
+import sys
+import threading
+import time
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+import numpy as np
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+for _p in (HERE, os.path.join(HERE, "..", "python")):
+    if os.path.exists(os.path.join(_p, "selcall.py")):
+        sys.path.insert(0, _p)
+import selcall as S  # noqa: E402
+
+try:
+    import sounddevice as sd
+    SD_ERROR = None
+except Exception as _ex:  # PortAudio не найден и т.п.
+    sd = None
+    SD_ERROR = _ex
+
+try:
+    import serial
+    import serial.tools.list_ports
+    SERIAL_ERROR = None
+except Exception as _ex:
+    serial = None
+    SERIAL_ERROR = _ex
+
+APP_NAME = "HF Selcall"
+VERSION = "dev"
+try:
+    from _version import VERSION  # noqa: F401  (подставляется при сборке)
+except Exception:
+    pass
+
+RX_FS = 8000
+MAX_MSG = S.MAX_MSG
+
+
+def app_dir():
+    if sys.platform.startswith("win"):
+        base = os.environ.get("APPDATA", os.path.expanduser("~"))
+    elif sys.platform == "darwin":
+        base = os.path.join(os.path.expanduser("~"), "Library", "Application Support")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME", os.path.join(os.path.expanduser("~"), ".config"))
+    d = os.path.join(base, "HFSelcall")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return d
+
+
+APP_DIR = app_dir()
+SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
+LOG_FILE = os.path.join(APP_DIR, "journal.log")
+
+DEFAULTS = dict(
+    my_id="1234", to_id="", in_dev="", out_dev="", ring_dev="",
+    dot_seconds=6.0, tx_level=0.5, translit=True,
+    afc=True, fixed_center=S.F_CENTER, show_all=True,
+    ptt_mode="vox", ptt_port="", ptt_delay=0.5, ptt_tail=0.3, mute_rx_on_tx=True,
+    ring=True, ring_style="codan", ring_volume=0.5, ring_seconds=30.0,
+)
+
+PTT_MODES = [("vox", "VOX (без управления)"), ("rts", "COM-порт, RTS"),
+             ("dtr", "COM-порт, DTR"), ("both", "COM-порт, RTS + DTR")]
+RING_STYLES = [("codan", "Двухтональный (как CODAN)"), ("vertex", "Трель (как Vertex)"),
+               ("beep", "Короткие гудки")]
+
+TRANSLIT = dict(zip("АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдеёжзийклмнопрстуфхцчшщъыьэюя№",
+                    ["A", "B", "V", "G", "D", "E", "E", "ZH", "Z", "I", "J", "K", "L", "M", "N", "O", "P",
+                     "R", "S", "T", "U", "F", "H", "C", "CH", "SH", "SCH", "", "Y", "", "E", "YU", "YA",
+                     "a", "b", "v", "g", "d", "e", "e", "zh", "z", "i", "j", "k", "l", "m", "n", "o", "p",
+                     "r", "s", "t", "u", "f", "h", "c", "ch", "sh", "sch", "", "y", "", "e", "yu", "ya", "N"]))
+
+
+def translit(s):
+    return "".join(TRANSLIT.get(ch, ch) for ch in s)
+
+
+def digits(s):
+    return "".join(ch for ch in str(s) if ch.isdigit())
+
+
+# ============================================================================ звук
+def lowpass_taps(fs, cutoff, n=127):
+    m = np.arange(n) - (n - 1) / 2
+    h = np.sinc(2 * cutoff / fs * m) * np.blackman(n)
+    return h / h.sum()
+
+
+class Downsampler:
+    """Поток fs_in -> 8000 Гц: ФНЧ 3,4 кГц + прореживание (целый коэффициент) или интерполяция."""
+
+    def __init__(self, fs_in):
+        self.fs_in = float(fs_in)
+        self.ratio = self.fs_in / RX_FS
+        self.taps = lowpass_taps(self.fs_in, 3400.0) if self.ratio > 1.001 else None
+        self.hist = np.zeros(0 if self.taps is None else len(self.taps) - 1)
+        self.pos = 0.0          # позиция следующего выходного отсчёта во входном потоке
+        self.consumed = 0       # сколько входных отсчётов уже отфильтровано
+
+    def push(self, x):
+        x = np.asarray(x, dtype=np.float64)
+        if self.taps is None:
+            return x.astype(np.float32)
+        z = np.concatenate((self.hist, x))
+        y = np.convolve(z, self.taps, mode="valid")          # len(y) == len(x)
+        self.hist = z[-(len(self.taps) - 1):]
+        start = self.consumed
+        self.consumed += len(y)
+        idx = np.arange(self.pos, self.consumed - 1, self.ratio)
+        if len(idx) == 0:
+            return np.zeros(0, dtype=np.float32)
+        self.pos = idx[-1] + self.ratio
+        out = np.interp(idx - start, np.arange(len(y)), y)
+        return out.astype(np.float32)
+
+
+def list_devices():
+    """[(index, name, max_in, max_out)] — только MME (на Win7 надёжнее всего), иначе все."""
+    if sd is None:
+        return []
+    try:
+        devs = sd.query_devices()
+        apis = sd.query_hostapis()
+    except Exception:
+        return []
+    mme = None
+    for i, a in enumerate(apis):
+        if "MME" in a.get("name", ""):
+            mme = i
+    out = []
+    for i, d in enumerate(devs):
+        if mme is not None and d.get("hostapi") != mme:
+            continue
+        out.append((i, d["name"], d["max_input_channels"], d["max_output_channels"]))
+    return out
+
+
+def device_index(name, kind):
+    if not name:
+        return None
+    for i, n, mi, mo in list_devices():
+        if n == name and ((kind == "in" and mi > 0) or (kind == "out" and mo > 0)):
+            return i
+    return None
+
+
+class Player:
+    """Проигрывание буфера на устройстве через собственный OutputStream (не sd.play — его
+    один поток на всё приложение, а нам нужны и передача, и звонок одновременно)."""
+
+    def __init__(self):
+        self.stream = None
+        self.lock = threading.Lock()
+
+    def play(self, data, fs, device, loop=False, done=None):
+        self.stop()
+        data = np.asarray(data, dtype=np.float32)
+        state = {"pos": 0, "finished": False}
+
+        def cb(outdata, frames, t, status):
+            p = state["pos"]
+            if loop:
+                idx = (p + np.arange(frames)) % len(data)
+                outdata[:, 0] = data[idx]
+                state["pos"] = (p + frames) % len(data)
+                return
+            chunk = data[p:p + frames]
+            outdata[:len(chunk), 0] = chunk
+            outdata[len(chunk):, 0] = 0
+            state["pos"] = p + frames
+            if p + frames >= len(data):
+                raise sd.CallbackStop
+
+        def fin():
+            if not state["finished"]:
+                state["finished"] = True
+                if done:
+                    done()
+
+        st = sd.OutputStream(samplerate=fs, device=device, channels=1, dtype="float32",
+                             callback=cb, finished_callback=fin, blocksize=1024)
+        with self.lock:
+            self.stream = st
+        st.start()
+
+    def stop(self):
+        with self.lock:
+            st, self.stream = self.stream, None
+        if st is not None:
+            try:
+                st.abort()
+                st.close()
+            except Exception:
+                pass
+
+    @property
+    def active(self):
+        st = self.stream
+        return st is not None and st.active
+
+
+def output_rate(device):
+    for fs in (48000, 44100):
+        try:
+            sd.check_output_settings(device=device, samplerate=fs, channels=1, dtype="float32")
+            return fs
+        except Exception:
+            continue
+    try:
+        return int(sd.query_devices(device if device is not None else sd.default.device[1])["default_samplerate"])
+    except Exception:
+        return 48000
+
+
+def ring_pattern(style, fs, volume):
+    out = []
+
+    def tone(f, sec):
+        n = int(sec * fs)
+        t = np.arange(n) / fs
+        w = np.ones(n)
+        r = max(1, int(0.004 * fs))
+        w[:r] = np.linspace(0, 1, r)
+        w[-r:] = np.linspace(1, 0, r)
+        out.append(volume * w * np.sin(2 * np.pi * f * t))
+
+    def silence(sec):
+        out.append(np.zeros(int(sec * fs)))
+
+    if style == "vertex":
+        for _ in range(2):
+            for _ in range(10):
+                tone(1500, 0.025)
+                tone(2000, 0.025)
+            silence(0.2)
+        silence(1.4)
+    elif style == "beep":
+        for _ in range(3):
+            tone(1200, 0.15)
+            silence(0.1)
+        silence(1.0)
+    else:
+        for _ in range(5):
+            tone(1000, 0.08)
+            tone(1300, 0.08)
+        silence(1.0)
+    return np.concatenate(out).astype(np.float32)
+
+
+# ============================================================================ PTT
+class SerialPTT:
+    def __init__(self):
+        self.ser = None
+        self.port = ""
+        self.keyed = False
+
+    @staticmethod
+    def ports():
+        if serial is None:
+            return []
+        try:
+            return sorted(p.device for p in serial.tools.list_ports.comports())
+        except Exception:
+            return []
+
+    def open(self, port):
+        if self.ser is not None and self.port == port:
+            return
+        self.close()
+        if serial is None:
+            raise RuntimeError("модуль pyserial недоступен: %s" % SERIAL_ERROR)
+        if not port:
+            raise RuntimeError("не выбран COM-порт для PTT")
+        s = serial.Serial()
+        s.port = port
+        s.baudrate = 9600
+        s.rts = False          # до открытия: pyserial выставит эти уровни сразу при open()
+        s.dtr = False
+        s.open()
+        self.ser = s
+        self.port = port
+        self.keyed = False
+
+    def set(self, on, mode):
+        if self.ser is None:
+            raise RuntimeError("COM-порт PTT не открыт")
+        if mode in ("rts", "both"):
+            self.ser.rts = on
+        if mode in ("dtr", "both"):
+            self.ser.dtr = on
+        self.keyed = on
+
+    def release(self):
+        if self.ser is not None:
+            try:
+                self.ser.rts = False
+                self.ser.dtr = False
+            except Exception:
+                pass
+        self.keyed = False
+
+    def close(self):
+        self.release()
+        if self.ser is not None:
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+        self.ser = None
+        self.port = ""
+
+
+# ============================================================================ ядро
+class Core:
+    """Настройки, приём, передача, PTT, звонок. С GUI общается через очередь событий."""
+
+    def __init__(self, ui_queue):
+        self.q = ui_queue
+        self.s = dict(DEFAULTS)
+        self.load()
+        self.rx = S.StreamReceiver(RX_FS)
+        self.audio_q = queue.Queue()
+        self.stream = None
+        self.down = None
+        self.rx_thread = None
+        self.receiving = False
+        self.rx_start = time.time()
+        self.level = 0.0
+        self.mute_until = 0.0
+        self.tx_player = Player()
+        self.ring_player = Player()
+        self.ring_timer = None
+        self.ptt = SerialPTT()
+        self.tx_queue = []
+        self.transmitting = False
+        self.watchdog = None
+
+    # ---- настройки
+    def load(self):
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                self.s.update(json.load(f))
+        except Exception:
+            pass
+
+    def save(self):
+        try:
+            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(self.s, f, ensure_ascii=False, indent=1)
+        except Exception:
+            pass
+
+    def journal(self, line):
+        try:
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+
+    # ---- приём
+    def start_rx(self):
+        if sd is None:
+            raise RuntimeError("звуковая библиотека недоступна: %s" % SD_ERROR)
+        self.stop_rx()
+        dev = device_index(self.s["in_dev"], "in")
+        last = None
+        for fs in (RX_FS, 48000, 44100):
+            try:
+                st = sd.InputStream(samplerate=fs, device=dev, channels=1, dtype="float32",
+                                    blocksize=int(fs // 10), callback=self._on_audio)
+                self.down = Downsampler(fs)
+                st.start()
+                self.stream = st
+                break
+            except Exception as ex:
+                last = ex
+        if self.stream is None:
+            raise RuntimeError("не удалось открыть вход: %s" % last)
+        self.audio_q = queue.Queue()
+        self.rx.reset()
+        self.rx_start = time.time()
+        self.receiving = True
+        self.rx_thread = threading.Thread(target=self._rx_loop, daemon=True)
+        self.rx_thread.start()
+        return int(self.stream.samplerate)
+
+    def stop_rx(self):
+        self.receiving = False
+        st, self.stream = self.stream, None
+        if st is not None:
+            try:
+                st.abort()
+                st.close()
+            except Exception:
+                pass
+        self.level = 0.0
+
+    def _on_audio(self, indata, frames, t, status):
+        x = indata[:, 0]
+        peak = float(np.max(np.abs(x))) if len(x) else 0.0
+        self.level = self.level * 0.6 + peak * 0.4
+        y = self.down.push(x)
+        if time.time() < self.mute_until:
+            y = np.zeros_like(y)
+        self.audio_q.put_nowait(y)       # аудиопоток не ждёт декодер
+
+    def _rx_loop(self):
+        while self.receiving:
+            time.sleep(1.0)
+            if not self.receiving:
+                break
+            try:
+                while True:
+                    try:
+                        self.rx.append(self.audio_q.get_nowait())
+                    except queue.Empty:
+                        break
+                self.rx.fixed_center = None if self.s["afc"] else float(self.s["fixed_center"])
+                calls = self.rx.process()
+                self.q.put(("centers", list(self.rx.last_centers)))
+                for c in calls:
+                    self.q.put(("rx", c, self.rx_start + c["time"], False))
+            except Exception as ex:
+                self.q.put(("error", "Ошибка декодера: %s" % ex))
+
+    # ---- PTT
+    def reopen_ptt(self):
+        if self.s["ptt_mode"] == "vox" or not self.s["ptt_port"]:
+            self.ptt.close()
+            return
+        self.ptt.open(self.s["ptt_port"])
+
+    def key(self, on):
+        mode = self.s["ptt_mode"]
+        if mode == "vox":
+            self.ptt.keyed = on
+            return
+        try:
+            if self.ptt.ser is None or self.ptt.port != self.s["ptt_port"]:
+                self.ptt.open(self.s["ptt_port"])
+            self.ptt.set(on, mode)
+        except Exception as ex:
+            self.ptt.release()
+            if on:
+                self.q.put(("error", "PTT: %s" % ex))
+
+    # ---- передача
+    def build(self, to_id, message, fs):
+        text = None
+        if message:
+            text = translit(message) if self.s["translit"] else message
+            text = text[:MAX_MSG]
+        stream = S.build_call(digits(to_id), digits(self.s["my_id"]), text)
+        y = S.modulate(stream, fs, float(self.s["dot_seconds"]), S.F_CENTER, float(self.s["tx_level"]))
+        return text or "", y
+
+    def send(self, to_id, message, title):
+        if sd is None:
+            return "Звуковая библиотека недоступна: %s" % SD_ERROR
+        to, me = digits(to_id), digits(self.s["my_id"])
+        if not to or not me or len(to) > 10 or len(me) > 10:
+            return "Укажите цифровые ID: свой и получателя (4 или 6 цифр)"
+        dev = device_index(self.s["out_dev"], "out")
+        fs = output_rate(dev)
+        text, y = self.build(to, message, fs)
+        lead = np.zeros(int(float(self.s["ptt_delay"]) * fs), dtype=np.float32)
+        tail = np.zeros(int(float(self.s["ptt_tail"]) * fs), dtype=np.float32)
+        audio = np.concatenate((lead, y, tail))
+        self.tx_queue.append((audio, fs, dev, me, to, text, title))
+        if not self.transmitting:
+            self._play_next()
+        return None
+
+    def _play_next(self):
+        if not self.tx_queue:
+            self._finish_tx()
+            return
+        audio, fs, dev, me, to, text, title = self.tx_queue.pop(0)
+        dur = len(audio) / fs
+        self.transmitting = True
+        if self.s["mute_rx_on_tx"]:
+            self.mute_until = time.time() + dur + 1.0
+        self.key(True)
+        self.q.put(("tx", me, to, text, title, dur))
+        if self.watchdog is not None:
+            self.watchdog.cancel()
+        self.watchdog = threading.Timer(dur + 5.0, self._watchdog_fire)
+        self.watchdog.daemon = True
+        self.watchdog.start()
+        try:
+            self.tx_player.play(audio, fs, dev, done=lambda: self.q.put(("tx_done",)))
+        except Exception as ex:
+            self.q.put(("error", "Ошибка передачи: %s" % ex))
+            self.stop_tx()
+
+    def tx_done(self):
+        if self.transmitting:
+            self._play_next()
+
+    def _watchdog_fire(self):
+        if self.transmitting:
+            self.q.put(("error", "Передача не завершилась вовремя — PTT снят принудительно"))
+            self.q.put(("stop_tx",))
+
+    def _finish_tx(self):
+        if self.watchdog is not None:
+            self.watchdog.cancel()
+            self.watchdog = None
+        self.key(False)
+        self.transmitting = False
+        if self.s["mute_rx_on_tx"]:
+            self.mute_until = time.time() + 0.5
+
+    def stop_tx(self):
+        self.tx_queue = []
+        self.tx_player.stop()
+        self._finish_tx()
+        self.ptt.release()
+        self.mute_until = 0.0
+
+    def test_ptt(self):
+        if self.transmitting:
+            return
+        if self.s["ptt_mode"] == "vox":
+            self.q.put(("info", "Режим VOX: трансивер управляется звуком, проверять нечего"))
+            return
+        self.key(True)
+        if not self.ptt.keyed:
+            return
+        self.q.put(("info", "Проверка PTT: %s — 1 с" % self.s["ptt_port"]))
+
+        def off():
+            if not self.transmitting:
+                self.key(False)
+        t = threading.Timer(1.0, off)
+        t.daemon = True
+        t.start()
+
+    # ---- звонок
+    def ring(self, seconds=None):
+        if sd is None:
+            return
+        self.stop_ring()
+        dev = device_index(self.s["ring_dev"], "out")
+        fs = output_rate(dev)
+        pat = ring_pattern(self.s["ring_style"], fs, float(self.s["ring_volume"]))
+        try:
+            self.ring_player.play(pat, fs, dev, loop=True)
+        except Exception as ex:
+            self.q.put(("error", "Звонок: %s" % ex))
+            return
+        self.ring_timer = threading.Timer(float(seconds or self.s["ring_seconds"]), self.stop_ring)
+        self.ring_timer.daemon = True
+        self.ring_timer.start()
+
+    def stop_ring(self):
+        if self.ring_timer is not None:
+            self.ring_timer.cancel()
+            self.ring_timer = None
+        self.ring_player.stop()
+
+    # ---- файлы
+    def save_wav(self, path, to_id, message):
+        text, y = self.build(to_id, message, 48000)
+        S.write_wav(path, y, 48000)
+
+    def decode_file(self, path):
+        x, fs = S.read_wav(path)
+        if fs != RX_FS:
+            d = Downsampler(fs)
+            x = d.push(x)
+        center = None if self.s["afc"] else float(self.s["fixed_center"])
+        return S.decode(x, RX_FS, center)
+
+    def shutdown(self):
+        try:
+            self.stop_tx()
+        except Exception:
+            pass
+        self.ptt.close()
+        self.stop_ring()
+        self.stop_rx()
+        self.save()
+
+
+# ============================================================================ GUI
+COLORS = dict(rx="#1b7f2a", rx_bad="#c06000", tx="#1f4fbf", info="#666666", error="#c00000",
+              mine="#0a5c1a")
+
+
+class App:
+    def __init__(self, root):
+        self.root = root
+        self.q = queue.Queue()
+        self.core = Core(self.q)
+        s = self.core.s
+        root.title("%s %s" % (APP_NAME, VERSION))
+        root.geometry("940x620")
+        root.minsize(760, 480)
+        try:
+            root.iconname(APP_NAME)
+        except Exception:
+            pass
+        self.font_mono = ("Consolas", 10) if sys.platform.startswith("win") else ("Menlo", 11)
+
+        self.v = dict(
+            my_id=tk.StringVar(value=s["my_id"]), to_id=tk.StringVar(value=s["to_id"]),
+            in_dev=tk.StringVar(value=s["in_dev"] or "По умолчанию"),
+            out_dev=tk.StringVar(value=s["out_dev"] or "По умолчанию"),
+            msg=tk.StringVar(), status=tk.StringVar(value="Готово"), afc=tk.StringVar(value="АПЧ —"),
+        )
+        self.incoming = None
+        self._build()
+        self.refresh_devices()
+        try:
+            self.core.reopen_ptt()
+        except Exception as ex:
+            self.add("PTT: %s" % ex, "error")
+        root.protocol("WM_DELETE_WINDOW", self.on_close)
+        if sd is None:
+            self.add("Звуковая библиотека недоступна: %s" % SD_ERROR, "error")
+        self.add("Нажмите «Приём», чтобы слушать эфир, или откройте запись (Ctrl+O). "
+                 "Передача в эфир на КВ требует лицензии.", "info")
+        root.after(100, self.poll)
+
+    # ---- построение окна
+    def _build(self):
+        root = self.root
+        top = ttk.Frame(root, padding=(8, 6))
+        top.pack(fill="x")
+        ttk.Label(top, text="Мой ID").pack(side="left")
+        e = ttk.Entry(top, textvariable=self.v["my_id"], width=9, font=self.font_mono)
+        e.pack(side="left", padx=(4, 10))
+        e.bind("<FocusOut>", lambda ev: self.store("my_id", digits(self.v["my_id"].get())))
+        ttk.Label(top, text="Вход").pack(side="left")
+        self.cb_in = ttk.Combobox(top, textvariable=self.v["in_dev"], width=24, state="readonly")
+        self.cb_in.pack(side="left", padx=(4, 8))
+        self.cb_in.bind("<<ComboboxSelected>>", lambda ev: self.on_dev("in_dev", self.v["in_dev"].get()))
+        ttk.Label(top, text="Выход").pack(side="left")
+        self.cb_out = ttk.Combobox(top, textvariable=self.v["out_dev"], width=24, state="readonly")
+        self.cb_out.pack(side="left", padx=(4, 4))
+        self.cb_out.bind("<<ComboboxSelected>>", lambda ev: self.on_dev("out_dev", self.v["out_dev"].get()))
+        ttk.Button(top, text="↻", width=3, command=self.refresh_devices).pack(side="left", padx=(0, 8))
+
+        self.btn_rx = ttk.Button(top, text="Приём", command=self.toggle_rx)
+        self.btn_rx.pack(side="right")
+        ttk.Button(top, text="Настройки", command=self.open_settings).pack(side="right", padx=4)
+        ttk.Label(top, textvariable=self.v["afc"], width=14, font=self.font_mono).pack(side="right", padx=4)
+        self.meter = tk.Canvas(top, width=80, height=12, highlightthickness=1, highlightbackground="#999")
+        self.meter.pack(side="right", padx=4)
+        self.meter_bar = self.meter.create_rectangle(0, 0, 0, 12, fill="#3a3", width=0)
+        lamp = tk.Canvas(top, width=40, height=14, highlightthickness=0)
+        lamp.pack(side="right", padx=4)
+        self.lamp = lamp.create_oval(2, 2, 12, 12, fill="#bbb", outline="")
+        lamp.create_text(26, 7, text="TX", font=("Segoe UI", 8, "bold"))
+        self.lamp_canvas = lamp
+
+        self.banner = tk.Frame(root, bg="#ffe2b8")
+        self.banner_lbl = tk.Label(self.banner, bg="#ffe2b8", font=("Segoe UI", 11, "bold"), anchor="w",
+                                   justify="left")
+        self.banner_lbl.pack(side="left", fill="x", expand=True, padx=10, pady=6)
+        ttk.Button(self.banner, text="Сбросить", command=self.dismiss_ring).pack(side="right", padx=6)
+        ttk.Button(self.banner, text="Ответить", command=self.answer_ring).pack(side="right")
+
+        mid = ttk.Frame(root)
+        mid.pack(fill="both", expand=True)
+        self.mid = mid
+        self.text = tk.Text(mid, wrap="word", state="disabled", font=self.font_mono, padx=6, pady=4)
+        sb = ttk.Scrollbar(mid, command=self.text.yview)
+        self.text.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.text.pack(side="left", fill="both", expand=True)
+        for k, c in COLORS.items():
+            self.text.tag_configure(k, foreground=c)
+        self.text.tag_configure("detail", foreground="#888888")
+        self.text.tag_configure("bold", font=self.font_mono + ("bold",))
+        self.text.bind("<Double-Button-1>", self.on_log_double)
+
+        bot = ttk.Frame(root, padding=(8, 6))
+        bot.pack(fill="x")
+        row1 = ttk.Frame(bot)
+        row1.pack(fill="x")
+        ttk.Label(row1, text="Кому").pack(side="left")
+        ttk.Entry(row1, textvariable=self.v["to_id"], width=9, font=self.font_mono).pack(side="left", padx=(4, 8))
+        ttk.Button(row1, text="Вызов", command=self.send_call).pack(side="left")
+        self.tx_lbl = ttk.Label(row1, textvariable=self.v["status"])
+        self.tx_lbl.pack(side="left", padx=12)
+        ttk.Button(row1, text="Декодировать WAV…", command=self.open_wav).pack(side="right")
+        ttk.Button(row1, text="Сохранить в WAV…", command=self.save_wav).pack(side="right", padx=4)
+        self.btn_abort = ttk.Button(row1, text="Прервать передачу", command=self.stop_tx)
+        row2 = ttk.Frame(bot)
+        row2.pack(fill="x", pady=(6, 0))
+        ent = ttk.Entry(row2, textvariable=self.v["msg"])
+        ent.pack(side="left", fill="x", expand=True)
+        ent.bind("<Return>", lambda ev: self.send_msg())
+        self.cnt = ttk.Label(row2, text="0/%d" % MAX_MSG, width=7)
+        self.cnt.pack(side="left", padx=6)
+        ttk.Button(row2, text="Отправить", command=self.send_msg).pack(side="left")
+        self.v["msg"].trace_add("write", lambda *a: self.cnt.configure(
+            text="%d/%d" % (min(len(self.v["msg"].get()), MAX_MSG), MAX_MSG)))
+        self.root.bind("<Control-o>", lambda ev: self.open_wav())
+        self.root.bind("<Escape>", lambda ev: self.dismiss_ring())
+
+    # ---- журнал
+    def add(self, text, tag="info", detail=None, sender=None):
+        now = datetime.datetime.now().strftime("%d.%m %H:%M:%S")
+        self.text.configure(state="normal")
+        start = self.text.index("end-1c")
+        self.text.insert("end", "[%s] " % now, "detail")
+        self.text.insert("end", text + "\n", tag)
+        if detail:
+            self.text.insert("end", "            " + detail + "\n", "detail")
+        if sender:
+            self.text.tag_add("from:" + sender, start, "end-1c")
+        self.text.configure(state="disabled")
+        self.text.see("end")
+        self.core.journal("[%s] %s%s" % (now, text, (" | " + detail) if detail else ""))
+
+    def on_log_double(self, ev):
+        idx = self.text.index("@%d,%d" % (ev.x, ev.y))
+        for t in self.text.tag_names(idx):
+            if t.startswith("from:"):
+                self.v["to_id"].set(t[5:])
+                self.store("to_id", t[5:])
+                return "break"
+
+    # ---- устройства
+    def refresh_devices(self):
+        devs = list_devices()
+        ins = ["По умолчанию"] + [n for _, n, mi, _ in devs if mi > 0]
+        outs = ["По умолчанию"] + [n for _, n, _, mo in devs if mo > 0]
+        self.cb_in["values"] = ins
+        self.cb_out["values"] = outs
+        self.dev_out_names = outs
+
+    def on_dev(self, key, name):
+        self.store(key, "" if name == "По умолчанию" else name)
+        if key == "in_dev" and self.core.receiving:
+            self.toggle_rx()
+            self.toggle_rx()
+
+    def store(self, key, val):
+        self.core.s[key] = val
+        self.core.save()
+
+    # ---- приём
+    def toggle_rx(self):
+        if self.core.receiving:
+            self.core.stop_rx()
+            self.btn_rx.configure(text="Приём")
+            self.add("Приём остановлен")
+            return
+        try:
+            fs = self.core.start_rx()
+            self.btn_rx.configure(text="Стоп приём")
+            self.add("Приём запущен (вход %d Гц)" % fs)
+        except Exception as ex:
+            self.add("Не удалось запустить приём: %s" % ex, "error")
+
+    def handle_rx(self, c, when, from_file):
+        me = digits(self.core.s["my_id"])
+        mine = c["to"] == me.zfill(len(c["to"]))
+        own = (not from_file) and c["from"] == me.zfill(len(c["from"]))
+        if not self.core.s["show_all"] and not mine and not from_file:
+            return
+        if c["eos"] == "ACK-BQ":
+            title = "Подтверждение"
+        elif c["message"]:
+            title = "Сообщение"
+        else:
+            title = "Вызов"
+        if own:
+            title = "Своя передача (эхо)"
+        else:
+            title += (" мне" if mine else "") + (" (файл)" if from_file else "")
+        line = "▼ %s  %s → %s" % (title, c["from"], c["to"])
+        if c["message"]:
+            line += "  «%s»" % c["message"]
+        detail = "fmt %s · cat %s · %s · ECC %s · %s · %.1f Гц%s%s" % (
+            c["format"], c["category"], c["eos"], c["ecc"], "принят" if c["ecc_ok"] else "СОМНИТЕЛЬНО",
+            c["center_hz"], " · LSB" if c["polarity"] == "inverted" else "",
+            (" · исправлено %d" % c["dx_rx_conflicts"]) if c["dx_rx_conflicts"] else "")
+        tag = ("mine" if mine else "rx") if c["ecc_ok"] else "rx_bad"
+        self.add(line, tag, detail, sender=c["from"])
+        if mine and not own and not from_file and c["ecc_ok"] and c["eos"] != "ACK-BQ":
+            self.show_incoming(title, c)
+
+    # ---- звонок
+    def show_incoming(self, title, c):
+        self.incoming = c
+        txt = "☎  %s от %s" % (title, c["from"])
+        if c["message"]:
+            txt += ":  " + c["message"]
+        self.banner_lbl.configure(text=txt)
+        self.banner.pack(fill="x", before=self.mid)
+        try:
+            self.root.deiconify()
+            self.root.lift()
+            if sys.platform.startswith("win"):
+                import ctypes
+                ctypes.windll.user32.FlashWindow(int(self.root.wm_frame(), 16), True)
+        except Exception:
+            pass
+        if self.core.s["ring"]:
+            self.core.ring()
+
+    def answer_ring(self):
+        if self.incoming:
+            self.v["to_id"].set(self.incoming["from"])
+            self.store("to_id", self.incoming["from"])
+        self.dismiss_ring()
+
+    def dismiss_ring(self):
+        self.core.stop_ring()
+        self.incoming = None
+        self.banner.pack_forget()
+
+    # ---- передача
+    def send_call(self):
+        self._send(None, "Вызов")
+
+    def send_msg(self):
+        m = self.v["msg"].get().strip()
+        if not m:
+            return
+        if self._send(m, "Сообщение"):
+            self.v["msg"].set("")
+
+    def _send(self, msg, title):
+        self.store("to_id", digits(self.v["to_id"].get()))
+        self.store("my_id", digits(self.v["my_id"].get()))
+        err = self.core.send(self.v["to_id"].get(), msg, title)
+        if err:
+            self.add(err, "error")
+            return False
+        return True
+
+    def stop_tx(self):
+        self.core.stop_tx()
+        self.add("Передача прервана", "info")
+
+    # ---- файлы
+    def save_wav(self):
+        to = digits(self.v["to_id"].get())
+        if not to:
+            self.add("Укажите получателя", "error")
+            return
+        p = filedialog.asksaveasfilename(defaultextension=".wav", filetypes=[("WAV", "*.wav")],
+                                         initialfile="selcall_%s_to_%s.wav" % (digits(self.core.s["my_id"]), to))
+        if not p:
+            return
+        try:
+            self.core.save_wav(p, to, self.v["msg"].get().strip() or None)
+            self.add("Сохранено: %s" % os.path.basename(p))
+        except Exception as ex:
+            self.add("Ошибка записи WAV: %s" % ex, "error")
+
+    def open_wav(self):
+        paths = filedialog.askopenfilenames(filetypes=[("WAV", "*.wav"), ("Все файлы", "*.*")])
+        for p in paths:
+            self.add("Декодирую %s…" % os.path.basename(p))
+
+            def work(path=p):
+                try:
+                    calls = self.core.decode_file(path)
+                    if not calls:
+                        self.q.put(("info", "%s: вызовов не найдено" % os.path.basename(path)))
+                    for c in calls:
+                        self.q.put(("rx", c, time.time(), True))
+                except Exception as ex:
+                    self.q.put(("error", "%s: %s" % (os.path.basename(path), ex)))
+            threading.Thread(target=work, daemon=True).start()
+
+    # ---- цикл событий
+    def poll(self):
+        try:
+            while True:
+                ev = self.q.get_nowait()
+                k = ev[0]
+                if k == "rx":
+                    self.handle_rx(ev[1], ev[2], ev[3])
+                elif k == "centers":
+                    if self.core.s["afc"] and ev[1]:
+                        self.v["afc"].set("АПЧ %.1f Гц" % ev[1][0])
+                elif k == "tx":
+                    _, me, to, text, title, dur = ev
+                    line = "▲ %s  %s → %s" % (title, me, to) + (("  «%s»" % text) if text else "")
+                    self.add(line, "tx", "%.1f с · ACK-RQ" % dur)
+                    self.v["status"].set("Передача…")
+                    self.btn_abort.pack(side="left")
+                elif k == "tx_done":
+                    self.core.tx_done()
+                elif k == "stop_tx":
+                    self.core.stop_tx()
+                elif k == "info":
+                    self.add(ev[1], "info")
+                elif k == "error":
+                    self.add(ev[1], "error")
+        except queue.Empty:
+            pass
+        if not self.core.transmitting and self.v["status"].get() != "Готово":
+            self.v["status"].set("Готово")
+            self.btn_abort.pack_forget()
+        if not self.core.s["afc"]:
+            self.v["afc"].set("f0 %.0f Гц" % float(self.core.s["fixed_center"]))
+        elif not self.core.receiving:
+            self.v["afc"].set("АПЧ —")
+        lv = min(1.0, self.core.level)
+        self.meter.coords(self.meter_bar, 0, 0, 80 * lv, 12)
+        self.meter.itemconfigure(self.meter_bar, fill="#c00" if lv > 0.9 else ("#d80" if lv > 0.6 else "#3a3"))
+        on = self.core.transmitting or self.core.ptt.keyed
+        self.lamp_canvas.itemconfigure(self.lamp, fill="#e00" if on else "#bbb")
+        self.root.after(100, self.poll)
+
+    # ---- настройки
+    def open_settings(self):
+        SettingsWindow(self)
+
+    def on_close(self):
+        self.core.shutdown()
+        self.root.destroy()
+
+
+class SettingsWindow:
+    def __init__(self, app):
+        self.app = app
+        c = app.core
+        s = c.s
+        w = tk.Toplevel(app.root)
+        w.title("Настройки")
+        w.transient(app.root)
+        w.resizable(False, False)
+        self.w = w
+        pad = dict(padx=8, pady=3, sticky="w")
+        self.v = dict(
+            dot=tk.DoubleVar(value=s["dot_seconds"]), level=tk.DoubleVar(value=s["tx_level"]),
+            translit=tk.BooleanVar(value=s["translit"]),
+            ptt_mode=tk.StringVar(value=dict(PTT_MODES).get(s["ptt_mode"], PTT_MODES[0][1])),
+            ptt_port=tk.StringVar(value=s["ptt_port"]),
+            ptt_delay=tk.DoubleVar(value=s["ptt_delay"]), ptt_tail=tk.DoubleVar(value=s["ptt_tail"]),
+            mute=tk.BooleanVar(value=s["mute_rx_on_tx"]),
+            afc=tk.BooleanVar(value=s["afc"]), center=tk.DoubleVar(value=s["fixed_center"]),
+            show_all=tk.BooleanVar(value=s["show_all"]),
+            ring=tk.BooleanVar(value=s["ring"]),
+            ring_style=tk.StringVar(value=dict(RING_STYLES).get(s["ring_style"], RING_STYLES[0][1])),
+            ring_dev=tk.StringVar(value=s["ring_dev"] or "По умолчанию"),
+            ring_vol=tk.DoubleVar(value=s["ring_volume"]), ring_sec=tk.DoubleVar(value=s["ring_seconds"]),
+        )
+        v = self.v
+
+        f = ttk.LabelFrame(w, text="Передача", padding=6)
+        f.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 4))
+        ttk.Label(f, text="Преамбула (точки), с").grid(row=0, column=0, **pad)
+        ttk.Spinbox(f, from_=0.4, to=12, increment=0.2, textvariable=v["dot"], width=6).grid(row=0, column=1, **pad)
+        ttk.Label(f, text="Уровень").grid(row=1, column=0, **pad)
+        ttk.Scale(f, from_=0.05, to=1.0, variable=v["level"], length=200).grid(row=1, column=1, **pad)
+        ttk.Checkbutton(f, text="Транслитерировать кириллицу в сообщениях",
+                        variable=v["translit"]).grid(row=2, column=0, columnspan=2, **pad)
+        ttk.Label(f, text="Для станций в режиме сканирования — не меньше цикла сканирования (6–12 с).",
+                  foreground="#666").grid(row=3, column=0, columnspan=2, **pad)
+
+        f = ttk.LabelFrame(w, text="Трансивер (PTT)", padding=6)
+        f.grid(row=1, column=0, sticky="ew", padx=10, pady=4)
+        ttk.Label(f, text="Управление передачей").grid(row=0, column=0, **pad)
+        ttk.Combobox(f, textvariable=v["ptt_mode"], values=[t for _, t in PTT_MODES], state="readonly",
+                     width=26).grid(row=0, column=1, columnspan=2, **pad)
+        ttk.Label(f, text="COM-порт").grid(row=1, column=0, **pad)
+        self.cb_port = ttk.Combobox(f, textvariable=v["ptt_port"], values=SerialPTT.ports(), width=12)
+        self.cb_port.grid(row=1, column=1, **pad)
+        bf = ttk.Frame(f)
+        bf.grid(row=1, column=2, **pad)
+        ttk.Button(bf, text="↻", width=3,
+                   command=lambda: self.cb_port.configure(values=SerialPTT.ports())).pack(side="left")
+        ttk.Button(bf, text="Проверить", command=self.test_ptt).pack(side="left", padx=4)
+        ttk.Label(f, text="Задержка PTT/VOX → сигнал, с").grid(row=2, column=0, **pad)
+        ttk.Spinbox(f, from_=0, to=3, increment=0.1, textvariable=v["ptt_delay"], width=6).grid(row=2, column=1, **pad)
+        ttk.Label(f, text="Хвост после сигнала, с").grid(row=3, column=0, **pad)
+        ttk.Spinbox(f, from_=0, to=2, increment=0.1, textvariable=v["ptt_tail"], width=6).grid(row=3, column=1, **pad)
+        ttk.Checkbutton(f, text="Не принимать во время передачи (не слышать свой сигнал)",
+                        variable=v["mute"]).grid(row=4, column=0, columnspan=3, **pad)
+
+        f = ttk.LabelFrame(w, text="Приём", padding=6)
+        f.grid(row=2, column=0, sticky="ew", padx=10, pady=4)
+        ttk.Checkbutton(f, text="Автоподстройка частоты (АПЧ)", variable=v["afc"]).grid(row=0, column=0, **pad)
+        ttk.Label(f, text="Центр без АПЧ, Гц").grid(row=1, column=0, **pad)
+        ttk.Spinbox(f, from_=1000, to=2600, increment=5, textvariable=v["center"], width=8).grid(row=1, column=1, **pad)
+        ttk.Checkbutton(f, text="Показывать вызовы не на мой ID", variable=v["show_all"]).grid(
+            row=2, column=0, columnspan=2, **pad)
+
+        f = ttk.LabelFrame(w, text="Звонок при вызове на мой ID", padding=6)
+        f.grid(row=3, column=0, sticky="ew", padx=10, pady=4)
+        ttk.Checkbutton(f, text="Звонить", variable=v["ring"]).grid(row=0, column=0, **pad)
+        ttk.Label(f, text="Сигнал").grid(row=1, column=0, **pad)
+        ttk.Combobox(f, textvariable=v["ring_style"], values=[t for _, t in RING_STYLES], state="readonly",
+                     width=26).grid(row=1, column=1, columnspan=2, **pad)
+        ttk.Label(f, text="Куда").grid(row=2, column=0, **pad)
+        ttk.Combobox(f, textvariable=v["ring_dev"], values=app.dev_out_names, state="readonly",
+                     width=26).grid(row=2, column=1, columnspan=2, **pad)
+        ttk.Label(f, text="Громкость").grid(row=3, column=0, **pad)
+        ttk.Scale(f, from_=0.05, to=1.0, variable=v["ring_vol"], length=160).grid(row=3, column=1, **pad)
+        ttk.Button(f, text="Прослушать", command=self.test_ring).grid(row=3, column=2, **pad)
+        ttk.Label(f, text="Звонить не дольше, с").grid(row=4, column=0, **pad)
+        ttk.Spinbox(f, from_=5, to=300, increment=5, textvariable=v["ring_sec"], width=6).grid(row=4, column=1, **pad)
+
+        b = ttk.Frame(w, padding=(10, 8))
+        b.grid(row=4, column=0, sticky="ew")
+        ttk.Button(b, text="Очистить журнал", command=self.clear_log).pack(side="left")
+        ttk.Button(b, text="Готово", command=self.close).pack(side="right")
+        w.protocol("WM_DELETE_WINDOW", self.close)
+        w.grab_set()
+
+    def _num(self, var, lo, hi, default):
+        try:
+            return max(lo, min(hi, float(str(var.get()).replace(",", "."))))
+        except Exception:
+            return default
+
+    def apply(self):
+        s = self.app.core.s
+        v = self.v
+        s["dot_seconds"] = self._num(v["dot"], 0.4, 12, 6.0)
+        s["tx_level"] = self._num(v["level"], 0.05, 1.0, 0.5)
+        s["translit"] = bool(v["translit"].get())
+        s["ptt_mode"] = next((k for k, t in PTT_MODES if t == v["ptt_mode"].get()), "vox")
+        s["ptt_port"] = v["ptt_port"].get().strip()
+        s["ptt_delay"] = self._num(v["ptt_delay"], 0, 3, 0.5)
+        s["ptt_tail"] = self._num(v["ptt_tail"], 0, 2, 0.3)
+        s["mute_rx_on_tx"] = bool(v["mute"].get())
+        s["afc"] = bool(v["afc"].get())
+        s["fixed_center"] = self._num(v["center"], 1000, 2600, S.F_CENTER)
+        s["show_all"] = bool(v["show_all"].get())
+        s["ring"] = bool(v["ring"].get())
+        s["ring_style"] = next((k for k, t in RING_STYLES if t == v["ring_style"].get()), "codan")
+        rd = v["ring_dev"].get()
+        s["ring_dev"] = "" if rd == "По умолчанию" else rd
+        s["ring_volume"] = self._num(v["ring_vol"], 0.05, 1.0, 0.5)
+        s["ring_seconds"] = self._num(v["ring_sec"], 5, 300, 30)
+        self.app.core.save()
+        try:
+            self.app.core.reopen_ptt()
+        except Exception as ex:
+            self.app.add("PTT: %s" % ex, "error")
+        if s["ring_dev"] == s["out_dev"]:
+            self.app.add("Звонок и передача идут на одно устройство: звонок может уйти в трансивер.", "error")
+
+    def test_ptt(self):
+        self.apply()
+        self.app.core.test_ptt()
+
+    def test_ring(self):
+        self.apply()
+        self.app.core.ring(seconds=4)
+
+    def clear_log(self):
+        t = self.app.text
+        t.configure(state="normal")
+        t.delete("1.0", "end")
+        t.configure(state="disabled")
+
+    def close(self):
+        self.apply()
+        self.w.grab_release()
+        self.w.destroy()
+
+
+# ============================================================================ самопроверка
+def selftest(out_path):
+    lines = []
+
+    def log(s):
+        lines.append(s)
+        print(s)
+
+    ok = True
+    log("%s %s, Python %s, %s" % (APP_NAME, VERSION, sys.version.split()[0], sys.platform))
+    log("numpy %s, sounddevice %s, pyserial %s" % (
+        np.__version__, getattr(sd, "__version__", "НЕТ (%s)" % SD_ERROR),
+        getattr(serial, "VERSION", "НЕТ (%s)" % SERIAL_ERROR)))
+    ok = ok and sd is not None and serial is not None
+    # кодер -> 48 кГц -> Downsampler (как в живом приёме) -> потоковый декодер
+    fs = 48000
+    y = S.modulate(S.build_call("1234", "5678", "TEST 73"), fs, 1.0)
+    y = np.concatenate((np.zeros(fs), y, np.zeros(2 * fs)))
+    y = y + np.random.default_rng(3).normal(0, 0.2, len(y))
+    d = Downsampler(fs)
+    rx = S.StreamReceiver(RX_FS)
+    got = []
+    for i in range(0, len(y), 4800):
+        rx.append(d.push(y[i:i + 4800]))
+        if (i // 4800) % 10 == 9:
+            got += rx.process()
+    got += rx.process(flush=True)
+    good = len(got) == 1 and got[0]["message"] == "TEST 73" and got[0]["ecc_ok"]
+    log("live chain 48k -> 8k -> stream decoder: %s" % ("OK" if good else "FAIL %r" % got))
+    ok = ok and good
+    for fs_in in (44100, 8000):
+        z = S.modulate(S.build_call("1234", "1111"), fs_in, 1.0)
+        dd = Downsampler(fs_in)
+        zz = np.concatenate([dd.push(z[i:i + 1000]) for i in range(0, len(z), 1000)])
+        r = S.decode(zz, RX_FS)
+        good = len(r) == 1 and r[0]["from"] == "1111"
+        log("downsampler %d -> 8000: %s" % (fs_in, "OK" if good else "FAIL"))
+        ok = ok and good
+    pat = ring_pattern("codan", 48000, 0.5)
+    log("ring pattern: %s" % ("OK" if len(pat) > 0 and np.abs(pat).max() <= 0.51 else "FAIL"))
+    log("serial ports: %s" % (SerialPTT.ports() or "нет"))
+    if sd is not None:
+        try:
+            log("audio devices (MME): %d" % len(list_devices()))
+        except Exception as ex:
+            log("audio devices: ошибка %s" % ex)
+    log("SELFTEST %s" % ("OK" if ok else "FAIL"))
+    try:
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    except Exception:
+        pass
+    return ok
+
+
+def main():
+    if "--selftest" in sys.argv:
+        base = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
+        sys.exit(0 if selftest(os.path.join(base, "selftest.txt")) else 1)
+    root = tk.Tk()
+    try:
+        ttk.Style().theme_use("vista" if sys.platform.startswith("win") else "clam")
+    except Exception:
+        pass
+    App(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

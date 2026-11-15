@@ -166,13 +166,18 @@ def estimate_center(x, fs):
 
 
 def tone_diff(x, fs, center):
-    n = np.arange(len(x))
+    x = np.asarray(x, dtype=np.float64)
+    N = len(x)
+    n = np.arange(N)
     L = max(1, int(round(fs / BAUD)))
-    k = np.ones(L) / L
+    k = np.arange(N)
+    lo = np.clip(k - L // 2, 0, N)
+    hi = np.clip(k - L // 2 + L, 0, N)
 
     def mag(f):
-        y = x * np.exp(-2j * np.pi * f * n / fs)
-        return np.abs(np.convolve(y, k, mode="same"))
+        # скользящее среднее длиной в бит через кумулятивную сумму (O(N))
+        c = np.concatenate(([0j], np.cumsum(x * np.exp(-2j * np.pi * f * n / fs))))
+        return np.abs(c[hi] - c[lo]) / L
 
     return mag(center + SHIFT / 2) - mag(center - SHIFT / 2)   # >0 => бит "1" (верхний тон)
 
@@ -182,7 +187,7 @@ def _find_calls_in_bits(bits):
     Счёт: RX-фазировка 104+i в q-20i и DX 125 в q-10-20m. Подходит и для
     короткой (6 RX, CODAN), и для полной (8 RX, M.493) фазировки."""
     N = len(bits)
-    if N < 400:
+    if N < 200:
         return []
     M = N - 9
     w = np.zeros(M, dtype=np.int32)
@@ -205,6 +210,7 @@ def _find_calls_in_bits(bits):
         taken.append(p)
         res = _extract(sym, int(p))
         if res:
+            res["endbit"] = int(p) + res.pop("_endrel")
             res["bitpos"] = max(0, int(p) - 230)          # примерно начало фазировки
             res["phasing_score"] = int(score[p])
             calls.append(res)
@@ -278,12 +284,12 @@ def _parse(L):
             else:
                 status = "BAD"
         if status != "BAD":
-            best = (j, status); break
+            best = (j, status, nxt is not None); break
         if best is None:
-            best = (j, status)
+            best = (j, status, nxt is not None)
     if best is None:
         return None
-    j, status = best
+    j, status, complete = best
     msg = vals[i:j]
     seg = L[:j + 1]
     conflicts = sum(1 for _, c, _ in seg if c)
@@ -301,6 +307,8 @@ def _parse(L):
         "ecc_ok": valid,
         "dx_rx_conflicts": conflicts,
         "single_copy": single,
+        "complete": complete,                 # после EOS виден ещё символ — кадр точно закончен
+        "_endrel": 70 + 20 * (j - 2),         # конец кадра в битах относительно якоря
     }
 
 
@@ -319,12 +327,13 @@ def _decode_at(x, fs, center):
     found = []
     for ph in np.arange(0, spb, spb / 8):
         idx = (ph + np.arange(int((len(d) - ph) / spb)) * spb).astype(int)
-        if len(idx) < 400:
+        if len(idx) < 200:
             continue
         raw = d[idx] > 0
         for bits, pol in ((raw, "normal"), (~raw, "inverted")):
             for c in _find_calls_in_bits(bits.astype(np.uint8)):
                 c["time"] = idx[c["bitpos"]] / fs
+                c["end_time"] = idx[min(len(idx) - 1, c.pop("endbit"))] / fs
                 c["polarity"] = pol
                 c["center_hz"] = round(center, 1)
                 found.append(c)
@@ -342,6 +351,70 @@ def _merge(found):
     for c in out:
         c.pop("bitpos", None)
     return out
+
+
+class StreamReceiver:
+    """Потоковый приём: копит отсчёты (fs, лучше 8000) в скользящем окне и
+    периодически ищет в нём вызовы. Возвращает только новые вызовы, время — от старта."""
+
+    def __init__(self, fs=8000, window=25.0, afc_seconds=20.0):
+        self.fs = fs
+        self.window = window
+        self.afc_seconds = afc_seconds
+        self.fixed_center = None
+        self.last_centers = []
+        self.reset()
+
+    def reset(self):
+        self.buf = np.zeros(0, dtype=np.float32)
+        self.base = 0
+        self.reported = []
+
+    @property
+    def now(self):
+        return (self.base + len(self.buf)) / self.fs
+
+    def append(self, x):
+        self.buf = np.concatenate((self.buf, np.asarray(x, dtype=np.float32)))
+        maxlen = int(self.window * self.fs)
+        if len(self.buf) > maxlen:
+            drop = len(self.buf) - maxlen
+            self.buf = self.buf[drop:]
+            self.base += drop
+
+    def process(self, flush=False):
+        fs = self.fs
+        if len(self.buf) < 2 * fs:
+            return []
+        x = self.buf.astype(np.float64)
+        if self.fixed_center is not None:
+            centers = [self.fixed_center]
+        else:
+            centers = estimate_centers(x[-int(self.afc_seconds * fs):], fs)
+            if not any(abs(c - F_CENTER) < 20 for c in centers):
+                centers.append(F_CENTER)
+        self.last_centers = centers
+        found = []
+        for c0 in centers:
+            found += _decode_at(x, fs, c0)
+        t0 = self.base / fs
+        end = self.now
+        out = []
+        for c in _merge(found):
+            abs_t = t0 + c["time"]
+            if any(abs(r - abs_t) < 1.0 for r in self.reported):
+                continue
+            # нет символа после EOS: ждём 1,5 с (EOS мог оказаться буквой текста)
+            if not c["complete"] and not flush and end - (t0 + c["end_time"]) < 1.5:
+                continue
+            if not c["ecc_ok"] and not flush and end - abs_t < 20:
+                continue
+            c["time"] = abs_t
+            c["end_time"] += t0
+            self.reported.append(abs_t)
+            out.append(c)
+        self.reported = [r for r in self.reported if r > t0 - 5]
+        return out
 
 
 # ---------------------------------------------------------------- WAV
@@ -414,6 +487,18 @@ def selftest():
     ok = len(res) == len(tests) and all(
         c["to"] == t[0] and c["from"] == t[1] and c["message"] == (t[2] or "") and c["ecc_ok"]
         for c, t in zip(res, tests))
+    rx = StreamReceiver(8000)
+    x8 = np.interp(np.arange(0, len(x), 6.0), np.arange(len(x)), x)   # 48k -> 8k (тест)
+    got = []
+    for i in range(0, len(x8), 800):
+        rx.append(x8[i:i + 800])
+        if (i // 800) % 10 == 9:
+            got += rx.process()
+    rx.append(np.zeros(16000))
+    got += rx.process(flush=True)
+    stream_ok = len(got) == len(tests) and all(c["ecc_ok"] for c in got)
+    print("stream decode:", "OK" if stream_ok else "FAIL (%d)" % len(got))
+    ok = ok and stream_ok
     ref = [125, 109, 125, 108, 125, 107, 125, 106, 125, 105, 125, 104, 120, 120, 12, 120, 34, 120,
            100, 12, 11, 34, 11, 100, 117, 11, 117, 11, 117, 117]
     frame_ok = build_call("1234", "1111") == ref

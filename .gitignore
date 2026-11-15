@@ -8,3 +8,8 @@ __pycache__/
 .DS_Store
 !testdata/*.wav
 .venv/
+windows/build/
+windows/dist/
+windows/*.spec
+windows/_version.py
+windows/selftest.txt
