@@ -5,6 +5,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-latest
@@ -33,3 +36,19 @@ jobs:
             build/HFSelcall.zip
             build/selcall-cli
           if-no-files-found: error
+
+      - name: Publish to release "latest"
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp build/HFSelcall.zip "build/HFSelcall-macOS.zip"
+          (cd build && zip -q selcall-cli-macOS.zip selcall-cli)
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest \
+            "build/HFSelcall-macOS.zip" "build/selcall-cli-macOS.zip" \
+            --target "$GITHUB_SHA" \
+            --title "HF Selcall (сборка ${GITHUB_SHA::7})" \
+            --notes "Автоматическая сборка из main (${GITHUB_SHA::7}). Universal (Apple Silicon + Intel), macOS 13+.
+
+          Установка: распакуйте HFSelcall-macOS.zip, перенесите «HF Selcall.app» в «Программы». Приложение не нотаризовано: при первом запуске правый клик → «Открыть» (или Системные настройки → Конфиденциальность и безопасность → «Всё равно открыть»)."
