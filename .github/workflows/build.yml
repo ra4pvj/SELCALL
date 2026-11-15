@@ -101,32 +101,35 @@ jobs:
           # загрузчик exe стартует ДО распаковки встроенного UCRT — он не должен сам требовать UCRT
           python -c "import pefile,sys; pe=pefile.PE(sys.argv[1]); d=sorted({e.dll.decode().lower() for e in pe.DIRECTORY_ENTRY_IMPORT}); print('bootloader imports:', d); bad=[x for x in d if x.startswith('api-ms-win-crt') or x in ('ucrtbase.dll','vcruntime140.dll')]; print('bootloader needs UCRT/VC runtime:', bad or 'no'); sys.exit(1 if bad else 0)" "$boot\runw.exe"
 
-      - name: Build exe (PyInstaller 5.13, UCRT bundled for Win7 without KB2999226)
+      # сборка папкой (onedir), как в HFP: ничего не распаковывается в %TEMP% при запуске
+      # (на Win7 onefile давал «Failed to extract ... dll»); UCRT кладётся рядом с exe
+      - name: Build exe folder (PyInstaller 5.13 onedir, UCRT bundled for Win7 without KB2999226)
         working-directory: windows
         run: |
           $ucrt = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Redist" -Recurse -Directory -Filter ${{ matrix.arch }} |
                   Where-Object { $_.FullName -match '\\ucrt\\DLLs\\' } | Sort-Object FullName | Select-Object -Last 1
           if (-not $ucrt) { throw "UCRT redistributable not found" }
           "UCRT: $($ucrt.FullName)  ($((Get-ChildItem "$($ucrt.FullName)\*.dll").Count) dll)"
-          python -m PyInstaller --noconfirm --onefile --windowed --name HFSelcall `
+          python -m PyInstaller --noconfirm --onedir --windowed --name HFSelcall `
             --paths ..\python --collect-all sounddevice --collect-all _sounddevice_data `
+            --hidden-import selcall_ptt --hidden-import serial.tools.list_ports `
             --add-binary "$($ucrt.FullName)\*.dll;." `
             hfselcall_win.py
 
       - name: Self-test of the built exe
         working-directory: windows
         run: |
-          $p = Start-Process -FilePath dist\HFSelcall.exe -ArgumentList "--selftest" -Wait -PassThru
-          Get-Content dist\selftest.txt
+          $p = Start-Process -FilePath dist\HFSelcall\HFSelcall.exe -ArgumentList "--selftest" -Wait -PassThru
+          Get-Content dist\HFSelcall\selftest.txt
           if ($p.ExitCode -ne 0) { throw "exe self-test failed ($($p.ExitCode))" }
-          Remove-Item dist\selftest.txt
+          Remove-Item dist\HFSelcall\selftest.txt
+          "ucrtbase.dll next to exe: $(Test-Path dist\HFSelcall\ucrtbase.dll)"
+          python check_win7.py dist\HFSelcall
 
       - name: Package
         run: |
-          New-Item -ItemType Directory -Force out | Out-Null
-          Copy-Item windows\dist\HFSelcall.exe out\
-          Copy-Item windows\README_WINDOWS.txt out\
-          Compress-Archive -Path out\HFSelcall.exe, out\README_WINDOWS.txt -DestinationPath "HFSelcall-Windows-${{ matrix.arch }}.zip"
+          Copy-Item windows\README_WINDOWS.txt windows\dist\HFSelcall\
+          Compress-Archive -Path windows\dist\HFSelcall -DestinationPath "HFSelcall-Windows-${{ matrix.arch }}.zip"
 
       - uses: actions/upload-artifact@v5
         with:
@@ -154,7 +157,7 @@ jobs:
 
           **macOS 13+** (Apple Silicon и Intel): HFSelcall-macOS.zip → перенесите «HF Selcall.app» в «Программы». Приложение не нотаризовано: первый запуск — правый клик → «Открыть».
 
-          **Windows 7 SP1 / 8 / 10 / 11**: HFSelcall-Windows-x64.zip (64-бит) или HFSelcall-Windows-x86.zip (32-бит; для 32-битной Windows 7). Распакуйте и запустите HFSelcall.exe, установка не нужна. На Windows 7 должно стоять обновление KB2533623 (обычно уже есть). SmartScreen: «Подробнее» → «Выполнить в любом случае».
+          **Windows 7 SP1 / 8 / 10 / 11**: HFSelcall-Windows-x64.zip (64-бит) или HFSelcall-Windows-x86.zip (32-бит; для 32-битной Windows 7). Распакуйте архив целиком (папка HFSelcall) и запустите HFSelcall.exe внутри, установка не нужна. На Windows 7 нужен SP1 и обновление KB2533623 (обычно уже есть); UCRT уже лежит в папке программы. SmartScreen: «Подробнее» → «Выполнить в любом случае».
 
           selcall-cli-macOS.zip — консольный кодер/декодер для macOS."
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then

@@ -24,16 +24,38 @@ final class AppModel: ObservableObject {
     @Published var myID: String { didSet { defaults.set(myID, forKey: "myID") } }
     @Published var dotSeconds: Double { didSet { defaults.set(dotSeconds, forKey: "dotSeconds") } }
     @Published var txLevel: Double { didSet { defaults.set(txLevel, forKey: "txLevel") } }
-    // трансивер (PTT)
-    @Published var pttMode: PTTMode { didSet { defaults.set(pttMode.rawValue, forKey: "pttMode"); reopenPTT() } }
+    // управление передачей (PTT / CAT, как в HFP)
+    @Published var pttMethod: PTTMethod {
+        didSet {
+            defaults.set(pttMethod.rawValue, forKey: "pttMethod")
+            if oldValue != pttMethod { pttBaud = pttMethod.defaultBaud }
+            reopenPTT()
+        }
+    }
     @Published var pttPort: String { didSet { defaults.set(pttPort, forKey: "pttPort"); reopenPTT() } }
+    @Published var pttBaud: Int { didSet { defaults.set(pttBaud, forKey: "pttBaud"); reopenPTT() } }
+    @Published var pttInvert: Bool { didSet { defaults.set(pttInvert, forKey: "pttInvert"); reopenPTT() } }
+    @Published var icomModel: String {
+        didSet {
+            defaults.set(icomModel, forKey: "icomModel")
+            if let a = PTTCat.icomModels.first(where: { $0.name == icomModel })?.addr {
+                icomAddr = String(format: "%02X", a)
+            }
+        }
+    }
+    @Published var icomAddr: String { didSet { defaults.set(icomAddr, forKey: "icomAddr"); reopenPTT() } }
+    @Published var kenwoodVariant: String { didSet { defaults.set(kenwoodVariant, forKey: "kenwood"); reopenPTT() } }
     @Published var pttDelay: Double { didSet { defaults.set(pttDelay, forKey: "pttDelay") } }
     @Published var pttTail: Double { didSet { defaults.set(pttTail, forKey: "pttTail") } }
     @Published var muteRxOnTx: Bool { didSet { defaults.set(muteRxOnTx, forKey: "muteRxOnTx") } }
     // звонок
     @Published var ringEnabled: Bool { didSet { defaults.set(ringEnabled, forKey: "ringEnabled") } }
     @Published var ringStyle: RingStyle { didSet { defaults.set(ringStyle.rawValue, forKey: "ringStyle") } }
-    @Published var ringDevice: AudioDeviceID { didSet { defaults.set(Int(ringDevice), forKey: "ringDev") } }
+    // самоконтроль: эфир и своя передача на одно или несколько устройств
+    @Published var monitorDevices: [String] { didSet { defaults.set(monitorDevices, forKey: "monDevs"); applyMonitor() } }
+    @Published var monitorRX: Bool { didSet { defaults.set(monitorRX, forKey: "monRX"); applyMonitor() } }
+    @Published var monitorTX: Bool { didSet { defaults.set(monitorTX, forKey: "monTX"); applyMonitor() } }
+    @Published var monitorLevel: Double { didSet { defaults.set(monitorLevel, forKey: "monLevel"); monitor.level = Float(monitorLevel) } }
     @Published var ringVolume: Double { didSet { defaults.set(ringVolume, forKey: "ringVolume") } }
     @Published var ringSeconds: Double { didSet { defaults.set(ringSeconds, forKey: "ringSeconds") } }
     @Published var transliterate: Bool { didSet { defaults.set(transliterate, forKey: "translit") } }
@@ -69,22 +91,34 @@ final class AppModel: ObservableObject {
     private var txReady = false
     private var muteUntil = Date.distantPast         // не декодировать собственную передачу
     private var txQueue: [(samples: [Float], entry: LogEntry)] = []
-    private let ptt = SerialPTT()
+    private let ptt = PTTController()
     private let ringer = Ringer()
+    private let monitor = Monitor()
     private var watchdog: DispatchWorkItem?
 
     init() {
         myID = defaults.string(forKey: "myID") ?? "1234"
         dotSeconds = defaults.object(forKey: "dotSeconds") as? Double ?? 6.0
         txLevel = defaults.object(forKey: "txLevel") as? Double ?? 0.5
-        pttMode = PTTMode(rawValue: defaults.string(forKey: "pttMode") ?? "") ?? .vox
+        // миграция настроек 0.3-dev: pttMode vox/rts/dtr/both
+        let legacy: [String: PTTMethod] = ["rts": .rts, "dtr": .dtr, "both": .rtsDtr, "vox": PTTMethod.none]
+        pttMethod = PTTMethod(rawValue: defaults.string(forKey: "pttMethod") ?? "")
+            ?? legacy[defaults.string(forKey: "pttMode") ?? ""] ?? PTTMethod.none
         pttPort = defaults.string(forKey: "pttPort") ?? ""
+        pttBaud = defaults.object(forKey: "pttBaud") as? Int ?? 9600
+        pttInvert = defaults.bool(forKey: "pttInvert")
+        icomModel = defaults.string(forKey: "icomModel") ?? "IC-7300"
+        icomAddr = defaults.string(forKey: "icomAddr") ?? "94"
+        kenwoodVariant = defaults.string(forKey: "kenwood") ?? "TX;"
+        monitorDevices = defaults.stringArray(forKey: "monDevs") ?? []
+        monitorRX = defaults.object(forKey: "monRX") as? Bool ?? true
+        monitorTX = defaults.object(forKey: "monTX") as? Bool ?? true
+        monitorLevel = defaults.object(forKey: "monLevel") as? Double ?? 0.5
         pttDelay = defaults.object(forKey: "pttDelay") as? Double ?? 0.5
         pttTail = defaults.object(forKey: "pttTail") as? Double ?? 0.3
         muteRxOnTx = defaults.object(forKey: "muteRxOnTx") as? Bool ?? true
         ringEnabled = defaults.object(forKey: "ringEnabled") as? Bool ?? true
         ringStyle = RingStyle(rawValue: defaults.string(forKey: "ringStyle") ?? "") ?? .codan
-        ringDevice = AudioDeviceID(defaults.integer(forKey: "ringDev"))
         ringVolume = defaults.object(forKey: "ringVolume") as? Double ?? 0.5
         ringSeconds = defaults.object(forKey: "ringSeconds") as? Double ?? 30
         transliterate = defaults.object(forKey: "translit") as? Bool ?? true
@@ -96,10 +130,14 @@ final class AppModel: ObservableObject {
         refreshDevices()
         audio.onSamples = { [weak self] x, peak in self?.onSamples(x, peak) }
         reopenPTT()
+        monitor.level = Float(monitorLevel)
+        applyMonitor()
         NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification,
                                                object: nil, queue: .main) { [weak self] _ in
+            self?.ptt.unkeySafe()
             self?.ptt.close()
             self?.ringer.stop()
+            self?.monitor.close()
         }
     }
 
@@ -111,42 +149,63 @@ final class AppModel: ObservableObject {
         outputDevices = all.filter { $0.outputs > 0 }
         if inputDevice != 0, !inputDevices.contains(where: { $0.id == inputDevice }) { inputDevice = 0 }
         if outputDevice != 0, !outputDevices.contains(where: { $0.id == outputDevice }) { outputDevice = 0 }
-        if ringDevice != 0, !outputDevices.contains(where: { $0.id == ringDevice }) { ringDevice = 0 }
-        pttPorts = SerialPTT.ports()
+        pttPorts = PTTController.ports()
     }
 
-    // MARK: PTT
+    // MARK: самоконтроль
+
+    /// ID выбранных устройств самоконтроля (по имени; отсутствующие пропускаются).
+    var monitorDeviceIDs: [AudioDeviceID] {
+        monitorDevices.compactMap { n in outputDevices.first(where: { $0.name == n })?.id }
+    }
+
+    func isMonitorDevice(_ d: AudioDevice) -> Bool { monitorDevices.contains(d.name) }
+
+    func setMonitorDevice(_ d: AudioDevice, _ on: Bool) {
+        if on, !monitorDevices.contains(d.name) { monitorDevices.append(d.name) }
+        if !on { monitorDevices.removeAll { $0 == d.name } }
+    }
+
+    private func applyMonitor() {
+        let ids = (monitorRX || monitorTX) ? monitorDeviceIDs : []
+        var names = [AudioDeviceID: String]()
+        for d in outputDevices { names[d.id] = d.name }
+        monitor.configure(devices: ids, names: names)
+        for e in monitor.errors { addError("Самоконтроль: \(e)") }
+    }
+
+    // MARK: PTT / CAT
+
+    var pttConfig: PTTConfig {
+        PTTConfig(method: pttMethod, port: pttPort, baud: pttBaud, invert: pttInvert,
+                  icomAddr: PTTCat.parseHexAddr(icomAddr) ?? 0x94, kenwood: kenwoodVariant)
+    }
 
     private func reopenPTT() {
-        guard pttMode.usesPort else { ptt.close(); pttKeyed = false; return }
-        guard !pttPort.isEmpty else { ptt.close(); return }
-        do {
-            try ptt.open(pttPort)
-        } catch {
-            addError("PTT: \(error.localizedDescription)")
-        }
-    }
-
-    private func keyPTT(_ on: Bool) {
-        guard pttMode.usesPort else { pttKeyed = on; return }
-        do {
-            if !ptt.isOpen { try ptt.open(pttPort) }
-            try ptt.set(on, lines: pttMode.lines)
-            pttKeyed = on
-        } catch {
-            ptt.release()
+        guard pttMethod.usesPort, !pttPort.isEmpty else {
+            ptt.configure(PTTConfig(method: pttMethod.usesPort ? pttMethod : PTTMethod.none))
             pttKeyed = false
-            if on { addError("PTT: \(error.localizedDescription)") }
+            return
         }
+        if let err = ptt.configure(pttConfig) { addError("PTT: \(err)") }
     }
 
-    /// Проверка PTT: включить передачу на 1 секунду без сигнала.
+    /// Включить/выключить передачу; false — PTT включить не удалось.
+    @discardableResult
+    private func keyPTT(_ on: Bool) -> Bool {
+        let err = on ? ptt.key(true) : ptt.unkeySafe()
+        pttKeyed = on && err == nil
+        if let e = err { addError(e) }
+        return err == nil
+    }
+
+    /// «Тест PTT»: включить передачу на 1 секунду без сигнала.
     func testPTT() {
         guard !transmitting else { return }
-        guard pttMode.usesPort else { addInfo("Режим VOX: трансивер управляется звуком, проверять нечего"); return }
-        keyPTT(true)
-        guard pttKeyed else { return }
-        addInfo("Проверка PTT: \(pttPort), \(pttMode.title) — 1 с")
+        guard pttMethod.usesPort else { addInfo("PTT не управляется (VOX / внешний PTT): проверять нечего"); return }
+        reopenPTT()
+        guard keyPTT(true) else { return }
+        addInfo("Тест PTT: \(pttMethod.title), \(pttPort) — 1 с (лучше на эквивалент нагрузки)")
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
             guard let self = self, !self.transmitting else { return }
             self.keyPTT(false)
@@ -166,7 +225,7 @@ final class AppModel: ObservableObject {
     }
 
     func testRing() {
-        ringer.start(style: ringStyle, device: ringDevice, volume: ringVolume, seconds: 4)
+        ringer.start(style: ringStyle, devices: monitorDeviceIDs, volume: ringVolume, seconds: 4)
     }
 
     // MARK: приём
@@ -209,9 +268,11 @@ final class AppModel: ObservableObject {
 
     private func onSamples(_ x: [Float], _ peak: Float) {
         let muted = Date() < muteUntil
+        let y = muted ? [Float](repeating: 0, count: x.count) : x
         dsp.async {
-            self.receiver.append(muted ? [Float](repeating: 0, count: x.count) : x)
+            self.receiver.append(y)
         }
+        if monitorRX { monitor.feedRX(y) }
         DispatchQueue.main.async { self.level = self.level * 0.6 + peak * 0.4 }
     }
 
@@ -255,7 +316,7 @@ final class AppModel: ObservableObject {
             incoming = entry
             NSApp.requestUserAttention(.criticalRequest)
             if ringEnabled {
-                ringer.start(style: ringStyle, device: ringDevice, volume: ringVolume, seconds: ringSeconds)
+                ringer.start(style: ringStyle, devices: monitorDeviceIDs, volume: ringVolume, seconds: ringSeconds)
             }
         }
     }
@@ -316,7 +377,15 @@ final class AppModel: ObservableObject {
         log.append(item.entry)
         let dur = Double(item.samples.count) / audio.outputRate
         if muteRxOnTx { muteUntil = Date().addingTimeInterval(dur + 1.0) }
-        keyPTT(true)
+        guard keyPTT(true) else {
+            addError("PTT не включился — передача отменена")
+            txQueue.removeAll()
+            finishTx()
+            return
+        }
+        if monitorTX && monitor.isActive {
+            monitor.feedTX(Resampler.resample(item.samples, from: audio.outputRate, to: Monitor.rate))
+        }
         // страховка: PTT снимается, даже если звук «завис»
         watchdog?.cancel()
         let w = DispatchWorkItem { [weak self] in
@@ -343,9 +412,9 @@ final class AppModel: ObservableObject {
     func stopTx() {
         txQueue.removeAll()
         audio.stopTx()
+        monitor.stopTX()
         txReady = false
         finishTx()
-        ptt.release()
         muteUntil = Date()
     }
 

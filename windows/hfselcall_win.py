@@ -33,13 +33,9 @@ except Exception as _ex:  # PortAudio не найден и т.п.
     sd = None
     SD_ERROR = _ex
 
-try:
-    import serial
-    import serial.tools.list_ports
-    SERIAL_ERROR = None
-except Exception as _ex:
-    serial = None
-    SERIAL_ERROR = _ex
+import selcall_ptt as PTT  # noqa: E402  (модуль PTT/CAT из проекта HFP)
+serial = PTT.serial
+SERIAL_ERROR = PTT.SERIAL_ERROR
 
 APP_NAME = "HF Selcall"
 VERSION = "dev"
@@ -72,15 +68,19 @@ SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
 LOG_FILE = os.path.join(APP_DIR, "journal.log")
 
 DEFAULTS = dict(
-    my_id="1234", to_id="", in_dev="", out_dev="", ring_dev="",
+    my_id="1234", to_id="", in_dev="", out_dev="",
     dot_seconds=6.0, tx_level=0.5, translit=True,
     afc=True, fixed_center=S.F_CENTER, show_all=True,
-    ptt_mode="vox", ptt_port="", ptt_delay=0.5, ptt_tail=0.3, mute_rx_on_tx=True,
+    ptt_method="none", ptt_port="", ptt_baud=9600, ptt_invert=False,
+    ptt_icom_model="IC-7300", ptt_icom_addr="94", ptt_kenwood="TX;",
+    ptt_delay=0.5, ptt_tail=0.3, mute_rx_on_tx=True,
+    mon_devs=[], mon_rx=True, mon_tx=True, mon_level=0.5,
     ring=True, ring_style="codan", ring_volume=0.5, ring_seconds=30.0,
 )
 
-PTT_MODES = [("vox", "VOX (без управления)"), ("rts", "COM-порт, RTS"),
-             ("dtr", "COM-порт, DTR"), ("both", "COM-порт, RTS + DTR")]
+PTT_TITLES = {"none": "нет (VOX / внешний PTT)", "RTS": "RTS", "DTR": "DTR", "RTS+DTR": "RTS + DTR",
+              "ICOM": "ICOM (CI-V)", "YAESU": "YAESU (TX1;/TX0;)", "YAESU-OLD": "YAESU-OLD (FT-817/857/897)",
+              "KENWOOD": "KENWOOD (TX;/RX;)", "ELECRAFT": "ELECRAFT (TX;/RX;)"}
 RING_STYLES = [("codan", "Двухтональный (как CODAN)"), ("vertex", "Трель (как Vertex)"),
                ("beep", "Короткие гудки")]
 
@@ -172,7 +172,7 @@ class Player:
         self.stream = None
         self.lock = threading.Lock()
 
-    def play(self, data, fs, device, loop=False, done=None):
+    def play(self, data, fs, device, loop=False, done=None, on_chunk=None):
         self.stop()
         data = np.asarray(data, dtype=np.float32)
         state = {"pos": 0, "finished": False}
@@ -186,6 +186,11 @@ class Player:
                 return
             chunk = data[p:p + frames]
             outdata[:len(chunk), 0] = chunk
+            if on_chunk is not None:
+                try:
+                    on_chunk(chunk)
+                except Exception:
+                    pass
             outdata[len(chunk):, 0] = 0
             state["pos"] = p + frames
             if p + frames >= len(data):
@@ -267,67 +272,92 @@ def ring_pattern(style, fs, volume):
     return np.concatenate(out).astype(np.float32)
 
 
-# ============================================================================ PTT
-class SerialPTT:
+# ============================================================================ самоконтроль
+class Monitor:
+    """Самоконтроль: звук эфира и/или своей передачи одновременно на одно или несколько
+    устройств (например, динамики ноутбука при трансивере на внешней звуковой карте).
+    Источник подаёт отсчёты 8 кГц; у каждого устройства свой буфер (не больше 0,5 с)."""
+
     def __init__(self):
-        self.ser = None
-        self.port = ""
-        self.keyed = False
+        self.outs = {}           # имя -> dict(stream, fs, buf, lock)
+        self.level = 0.5
+        self.errors = []
 
-    @staticmethod
-    def ports():
-        if serial is None:
-            return []
-        try:
-            return sorted(p.device for p in serial.tools.list_ports.comports())
-        except Exception:
-            return []
-
-    def open(self, port):
-        if self.ser is not None and self.port == port:
+    def configure(self, names, level):
+        self.level = float(level)
+        names = [n for n in names if n]
+        for n in list(self.outs):
+            if n not in names:
+                self._close(n)
+        self.errors = []
+        if sd is None:
             return
-        self.close()
-        if serial is None:
-            raise RuntimeError("модуль pyserial недоступен: %s" % SERIAL_ERROR)
-        if not port:
-            raise RuntimeError("не выбран COM-порт для PTT")
-        s = serial.Serial()
-        s.port = port
-        s.baudrate = 9600
-        s.rts = False          # до открытия: pyserial выставит эти уровни сразу при open()
-        s.dtr = False
-        s.open()
-        self.ser = s
-        self.port = port
-        self.keyed = False
+        for n in names:
+            if n in self.outs:
+                continue
+            dev = device_index(n, "out")
+            if dev is None:
+                self.errors.append("%s: устройство не найдено" % n)
+                continue
+            for fs in (RX_FS, 48000, 44100):
+                o = dict(fs=fs, buf=np.zeros(0, np.float32), lock=threading.Lock())
+                try:
+                    st = sd.OutputStream(samplerate=fs, device=dev, channels=1, dtype="float32",
+                                         blocksize=int(fs // 20), callback=self._cb(o))
+                    st.start()
+                    o["stream"] = st
+                    self.outs[n] = o
+                    break
+                except Exception as ex:
+                    err = ex
+            else:
+                self.errors.append("%s: %s" % (n, err))
 
-    def set(self, on, mode):
-        if self.ser is None:
-            raise RuntimeError("COM-порт PTT не открыт")
-        if mode in ("rts", "both"):
-            self.ser.rts = on
-        if mode in ("dtr", "both"):
-            self.ser.dtr = on
-        self.keyed = on
+    def _cb(self, o):
+        def cb(outdata, frames, t, status):
+            with o["lock"]:
+                b = o["buf"]
+                k = min(frames, len(b))
+                outdata[:k, 0] = b[:k] * self.level
+                outdata[k:, 0] = 0
+                o["buf"] = b[k:]
+        return cb
 
-    def release(self):
-        if self.ser is not None:
+    def feed(self, x8):
+        """x8 — отсчёты 8 кГц"""
+        if not self.outs or len(x8) == 0:
+            return
+        x8 = np.asarray(x8, dtype=np.float32)
+        for o in list(self.outs.values()):
+            y = x8
+            if o["fs"] != RX_FS:
+                n = int(len(x8) * o["fs"] / RX_FS)
+                y = np.interp(np.arange(n) * RX_FS / o["fs"], np.arange(len(x8)), x8).astype(np.float32)
+            with o["lock"]:
+                b = np.concatenate((o["buf"], y))
+                cap = int(0.5 * o["fs"])
+                o["buf"] = b[-cap:] if len(b) > cap else b
+
+    def _close(self, n):
+        o = self.outs.pop(n, None)
+        if o and o.get("stream") is not None:
             try:
-                self.ser.rts = False
-                self.ser.dtr = False
+                o["stream"].abort()
+                o["stream"].close()
             except Exception:
                 pass
-        self.keyed = False
 
     def close(self):
-        self.release()
-        if self.ser is not None:
-            try:
-                self.ser.close()
-            except Exception:
-                pass
-        self.ser = None
-        self.port = ""
+        for n in list(self.outs):
+            self._close(n)
+
+
+def to_8k(x, fs):
+    x = np.asarray(x, dtype=np.float32)
+    if fs == RX_FS or len(x) == 0:
+        return x
+    n = int(len(x) * RX_FS / fs)
+    return np.interp(np.arange(n) * fs / RX_FS, np.arange(len(x)), x).astype(np.float32)
 
 
 # ============================================================================ ядро
@@ -348,9 +378,10 @@ class Core:
         self.level = 0.0
         self.mute_until = 0.0
         self.tx_player = Player()
-        self.ring_player = Player()
+        self.ring_players = []
         self.ring_timer = None
-        self.ptt = SerialPTT()
+        self.ptt = PTT.PttController()
+        self.monitor = Monitor()
         self.tx_queue = []
         self.transmitting = False
         self.watchdog = None
@@ -362,6 +393,14 @@ class Core:
                 self.s.update(json.load(f))
         except Exception:
             pass
+        old = self.s.pop("ptt_mode", None)          # настройки версии 0.3-dev
+        if old in ("rts", "dtr", "both"):
+            self.s["ptt_method"] = {"rts": "RTS", "dtr": "DTR", "both": "RTS+DTR"}[old]
+        rd = self.s.pop("ring_dev", None)
+        if rd and not self.s.get("mon_devs"):
+            self.s["mon_devs"] = [rd]
+        if self.s.get("ptt_method") not in PTT.METHODS:
+            self.s["ptt_method"] = "none"
 
     def save(self):
         try:
@@ -423,6 +462,8 @@ class Core:
         if time.time() < self.mute_until:
             y = np.zeros_like(y)
         self.audio_q.put_nowait(y)       # аудиопоток не ждёт декодер
+        if self.s["mon_rx"]:
+            self.monitor.feed(y)
 
     def _rx_loop(self):
         while self.receiving:
@@ -443,26 +484,31 @@ class Core:
             except Exception as ex:
                 self.q.put(("error", "Ошибка декодера: %s" % ex))
 
-    # ---- PTT
+    # ---- PTT / CAT (логика из HFP)
+    def ptt_cfg(self):
+        s = self.s
+        try:
+            addr = PTT.parse_hex_addr(s["ptt_icom_addr"])
+        except Exception:
+            addr = 0x94
+        return dict(method=s["ptt_method"], port=s["ptt_port"], baud=int(s["ptt_baud"] or 9600),
+                    invert=bool(s["ptt_invert"]), icom_addr=addr, kenwood_variant=s["ptt_kenwood"])
+
     def reopen_ptt(self):
-        if self.s["ptt_mode"] == "vox" or not self.s["ptt_port"]:
-            self.ptt.close()
-            return
-        self.ptt.open(self.s["ptt_port"])
+        """(пере)открыть порт по настройкам; возвращает текст ошибки или None"""
+        return self.ptt.configure(self.ptt_cfg())
 
     def key(self, on):
-        mode = self.s["ptt_mode"]
-        if mode == "vox":
-            self.ptt.keyed = on
-            return
-        try:
-            if self.ptt.ser is None or self.ptt.port != self.s["ptt_port"]:
-                self.ptt.open(self.s["ptt_port"])
-            self.ptt.set(on, mode)
-        except Exception as ex:
-            self.ptt.release()
-            if on:
-                self.q.put(("error", "PTT: %s" % ex))
+        if on:
+            return self.ptt.key(True)
+        return self.ptt.unkey_safe()
+
+    # ---- самоконтроль
+    def apply_monitor(self):
+        devs = list(self.s.get("mon_devs") or [])
+        active = devs if (self.s["mon_rx"] or self.s["mon_tx"]) else []
+        self.monitor.configure(active, self.s["mon_level"])
+        return self.monitor.errors
 
     # ---- передача
     def build(self, to_id, message, fs):
@@ -500,7 +546,12 @@ class Core:
         self.transmitting = True
         if self.s["mute_rx_on_tx"]:
             self.mute_until = time.time() + dur + 1.0
-        self.key(True)
+        err = self.key(True)
+        if err:
+            self.q.put(("error", "%s — передача отменена" % err))
+            self.tx_queue = []
+            self._finish_tx()
+            return
         self.q.put(("tx", me, to, text, title, dur))
         if self.watchdog is not None:
             self.watchdog.cancel()
@@ -508,7 +559,8 @@ class Core:
         self.watchdog.daemon = True
         self.watchdog.start()
         try:
-            self.tx_player.play(audio, fs, dev, done=lambda: self.q.put(("tx_done",)))
+            mon = (lambda ch, f=fs: self.monitor.feed(to_8k(ch, f))) if self.s["mon_tx"] else None
+            self.tx_player.play(audio, fs, dev, done=lambda: self.q.put(("tx_done",)), on_chunk=mon)
         except Exception as ex:
             self.q.put(("error", "Ошибка передачи: %s" % ex))
             self.stop_tx()
@@ -535,19 +587,20 @@ class Core:
         self.tx_queue = []
         self.tx_player.stop()
         self._finish_tx()
-        self.ptt.release()
         self.mute_until = 0.0
 
     def test_ptt(self):
         if self.transmitting:
             return
-        if self.s["ptt_mode"] == "vox":
-            self.q.put(("info", "Режим VOX: трансивер управляется звуком, проверять нечего"))
+        if self.s["ptt_method"] == "none":
+            self.q.put(("info", "PTT не управляется (VOX / внешний PTT): проверять нечего"))
             return
-        self.key(True)
-        if not self.ptt.keyed:
+        err = self.reopen_ptt() or self.key(True)
+        if err:
+            self.q.put(("error", err))
             return
-        self.q.put(("info", "Проверка PTT: %s — 1 с" % self.s["ptt_port"]))
+        self.q.put(("info", "Тест PTT: %s, %s — 1 с (лучше на эквивалент нагрузки)" %
+                    (PTT_TITLES.get(self.s["ptt_method"]), self.s["ptt_port"])))
 
         def off():
             if not self.transmitting:
@@ -561,14 +614,17 @@ class Core:
         if sd is None:
             return
         self.stop_ring()
-        dev = device_index(self.s["ring_dev"], "out")
-        fs = output_rate(dev)
-        pat = ring_pattern(self.s["ring_style"], fs, float(self.s["ring_volume"]))
-        try:
-            self.ring_player.play(pat, fs, dev, loop=True)
-        except Exception as ex:
-            self.q.put(("error", "Звонок: %s" % ex))
-            return
+        names = [n for n in (self.s.get("mon_devs") or []) if n] or [""]
+        for n in names:
+            dev = device_index(n, "out") if n else None
+            fs = output_rate(dev)
+            pat = ring_pattern(self.s["ring_style"], fs, float(self.s["ring_volume"]))
+            pl = Player()
+            try:
+                pl.play(pat, fs, dev, loop=True)
+                self.ring_players.append(pl)
+            except Exception as ex:
+                self.q.put(("error", "Звонок (%s): %s" % (n or "системный выход", ex)))
         self.ring_timer = threading.Timer(float(seconds or self.s["ring_seconds"]), self.stop_ring)
         self.ring_timer.daemon = True
         self.ring_timer.start()
@@ -577,7 +633,9 @@ class Core:
         if self.ring_timer is not None:
             self.ring_timer.cancel()
             self.ring_timer = None
-        self.ring_player.stop()
+        for pl in self.ring_players:
+            pl.stop()
+        self.ring_players = []
 
     # ---- файлы
     def save_wav(self, path, to_id, message):
@@ -600,6 +658,7 @@ class Core:
         self.ptt.close()
         self.stop_ring()
         self.stop_rx()
+        self.monitor.close()
         self.save()
 
 
@@ -632,10 +691,11 @@ class App:
         self.incoming = None
         self._build()
         self.refresh_devices()
-        try:
-            self.core.reopen_ptt()
-        except Exception as ex:
-            self.add("PTT: %s" % ex, "error")
+        err = self.core.reopen_ptt()
+        if err:
+            self.add("PTT: %s" % err, "error")
+        for e in self.core.apply_monitor():
+            self.add("Самоконтроль: %s" % e, "error")
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         if sd is None:
             self.add("Звуковая библиотека недоступна: %s" % SD_ERROR, "error")
@@ -955,15 +1015,19 @@ class SettingsWindow:
         self.v = dict(
             dot=tk.DoubleVar(value=s["dot_seconds"]), level=tk.DoubleVar(value=s["tx_level"]),
             translit=tk.BooleanVar(value=s["translit"]),
-            ptt_mode=tk.StringVar(value=dict(PTT_MODES).get(s["ptt_mode"], PTT_MODES[0][1])),
-            ptt_port=tk.StringVar(value=s["ptt_port"]),
+            ptt_method=tk.StringVar(value=PTT_TITLES.get(s["ptt_method"], PTT_TITLES["none"])),
+            ptt_port=tk.StringVar(value=s["ptt_port"]), ptt_baud=tk.StringVar(value=str(s["ptt_baud"])),
+            ptt_invert=tk.BooleanVar(value=s["ptt_invert"]),
+            icom_model=tk.StringVar(value=s["ptt_icom_model"]), icom_addr=tk.StringVar(value=s["ptt_icom_addr"]),
+            kenwood=tk.StringVar(value=s["ptt_kenwood"]),
+            mon_rx=tk.BooleanVar(value=s["mon_rx"]), mon_tx=tk.BooleanVar(value=s["mon_tx"]),
+            mon_level=tk.DoubleVar(value=s["mon_level"]),
             ptt_delay=tk.DoubleVar(value=s["ptt_delay"]), ptt_tail=tk.DoubleVar(value=s["ptt_tail"]),
             mute=tk.BooleanVar(value=s["mute_rx_on_tx"]),
             afc=tk.BooleanVar(value=s["afc"]), center=tk.DoubleVar(value=s["fixed_center"]),
             show_all=tk.BooleanVar(value=s["show_all"]),
             ring=tk.BooleanVar(value=s["ring"]),
             ring_style=tk.StringVar(value=dict(RING_STYLES).get(s["ring_style"], RING_STYLES[0][1])),
-            ring_dev=tk.StringVar(value=s["ring_dev"] or "По умолчанию"),
             ring_vol=tk.DoubleVar(value=s["ring_volume"]), ring_sec=tk.DoubleVar(value=s["ring_seconds"]),
         )
         v = self.v
@@ -979,25 +1043,40 @@ class SettingsWindow:
         ttk.Label(f, text="Для станций в режиме сканирования — не меньше цикла сканирования (6–12 с).",
                   foreground="#666").grid(row=3, column=0, columnspan=2, **pad)
 
-        f = ttk.LabelFrame(w, text="Трансивер (PTT)", padding=6)
+        f = ttk.LabelFrame(w, text="Управление передачей (PTT / CAT)", padding=6)
         f.grid(row=1, column=0, sticky="ew", padx=10, pady=4)
-        ttk.Label(f, text="Управление передачей").grid(row=0, column=0, **pad)
-        ttk.Combobox(f, textvariable=v["ptt_mode"], values=[t for _, t in PTT_MODES], state="readonly",
-                     width=26).grid(row=0, column=1, columnspan=2, **pad)
+        ttk.Label(f, text="Метод").grid(row=0, column=0, **pad)
+        cb = ttk.Combobox(f, textvariable=v["ptt_method"], values=[PTT_TITLES[m] for m in PTT.METHODS],
+                          state="readonly", width=28)
+        cb.grid(row=0, column=1, columnspan=3, **pad)
+        cb.bind("<<ComboboxSelected>>", lambda ev: self.on_method())
         ttk.Label(f, text="COM-порт").grid(row=1, column=0, **pad)
-        self.cb_port = ttk.Combobox(f, textvariable=v["ptt_port"], values=SerialPTT.ports(), width=12)
+        self.cb_port = ttk.Combobox(f, textvariable=v["ptt_port"], values=self.ports(), width=12)
         self.cb_port.grid(row=1, column=1, **pad)
+        ttk.Label(f, text="Скорость").grid(row=1, column=2, **pad)
+        ttk.Combobox(f, textvariable=v["ptt_baud"], values=[str(b) for b in PTT.BAUDS], width=8).grid(
+            row=1, column=3, **pad)
         bf = ttk.Frame(f)
-        bf.grid(row=1, column=2, **pad)
-        ttk.Button(bf, text="↻", width=3,
-                   command=lambda: self.cb_port.configure(values=SerialPTT.ports())).pack(side="left")
-        ttk.Button(bf, text="Проверить", command=self.test_ptt).pack(side="left", padx=4)
-        ttk.Label(f, text="Задержка PTT/VOX → сигнал, с").grid(row=2, column=0, **pad)
-        ttk.Spinbox(f, from_=0, to=3, increment=0.1, textvariable=v["ptt_delay"], width=6).grid(row=2, column=1, **pad)
-        ttk.Label(f, text="Хвост после сигнала, с").grid(row=3, column=0, **pad)
-        ttk.Spinbox(f, from_=0, to=2, increment=0.1, textvariable=v["ptt_tail"], width=6).grid(row=3, column=1, **pad)
+        bf.grid(row=2, column=1, columnspan=3, **pad)
+        ttk.Button(bf, text="↻ порты", command=lambda: self.cb_port.configure(values=self.ports())).pack(side="left")
+        ttk.Button(bf, text="Тест PTT (1 с)", command=self.test_ptt).pack(side="left", padx=4)
+        ttk.Checkbutton(bf, text="Инверсия RTS/DTR", variable=v["ptt_invert"]).pack(side="left", padx=4)
+        ttk.Label(f, text="ICOM: модель / адрес CI-V").grid(row=3, column=0, **pad)
+        cm = ttk.Combobox(f, textvariable=v["icom_model"], values=list(PTT.ICOM_MODELS), state="readonly", width=16)
+        cm.grid(row=3, column=1, columnspan=2, **pad)
+        cm.bind("<<ComboboxSelected>>", lambda ev: self.on_icom())
+        ttk.Entry(f, textvariable=v["icom_addr"], width=6).grid(row=3, column=3, **pad)
+        ttk.Label(f, text="KENWOOD: команда TX").grid(row=4, column=0, **pad)
+        ttk.Combobox(f, textvariable=v["kenwood"], values=PTT.KENWOOD_VARIANTS, state="readonly", width=6).grid(
+            row=4, column=1, **pad)
+        ttk.Label(f, text="Задержка PTT → сигнал, с").grid(row=5, column=0, **pad)
+        ttk.Spinbox(f, from_=0, to=3, increment=0.1, textvariable=v["ptt_delay"], width=6).grid(row=5, column=1, **pad)
+        ttk.Label(f, text="Хвост, с").grid(row=5, column=2, **pad)
+        ttk.Spinbox(f, from_=0, to=2, increment=0.1, textvariable=v["ptt_tail"], width=6).grid(row=5, column=3, **pad)
         ttk.Checkbutton(f, text="Не принимать во время передачи (не слышать свой сигнал)",
-                        variable=v["mute"]).grid(row=4, column=0, columnspan=3, **pad)
+                        variable=v["mute"]).grid(row=6, column=0, columnspan=4, **pad)
+        ttk.Label(f, text="CAT-команды по документации производителей; проверяйте «Тестом PTT» на эквиваленте.",
+                  foreground="#666").grid(row=7, column=0, columnspan=4, **pad)
 
         f = ttk.LabelFrame(w, text="Приём", padding=6)
         f.grid(row=2, column=0, sticky="ew", padx=10, pady=4)
@@ -1007,27 +1086,57 @@ class SettingsWindow:
         ttk.Checkbutton(f, text="Показывать вызовы не на мой ID", variable=v["show_all"]).grid(
             row=2, column=0, columnspan=2, **pad)
 
+        f = ttk.LabelFrame(w, text="Самоконтроль (динамики, наушники — можно несколько)", padding=6)
+        f.grid(row=0, column=1, rowspan=2, sticky="nsew", padx=10, pady=(10, 4))
+        ttk.Checkbutton(f, text="Слушать эфир (вход)", variable=v["mon_rx"]).grid(row=0, column=0, **pad)
+        ttk.Checkbutton(f, text="Слушать свою передачу", variable=v["mon_tx"]).grid(row=1, column=0, **pad)
+        ttk.Label(f, text="Уровень самоконтроля").grid(row=2, column=0, **pad)
+        ttk.Scale(f, from_=0.0, to=1.0, variable=v["mon_level"], length=180).grid(row=3, column=0, **pad)
+        ttk.Label(f, text="Устройства:").grid(row=4, column=0, **pad)
+        self.mon_vars = {}
+        chosen = set(s.get("mon_devs") or [])
+        names = [n for n in app.dev_out_names if n != "По умолчанию"]
+        for i, n in enumerate(names):
+            bv = tk.BooleanVar(value=n in chosen)
+            self.mon_vars[n] = bv
+            ttk.Checkbutton(f, text=n[:40], variable=bv).grid(row=5 + i, column=0, padx=16, pady=1, sticky="w")
+        if not names:
+            ttk.Label(f, text="(нет устройств вывода)", foreground="#666").grid(row=5, column=0, **pad)
+        ttk.Label(f, text="Не отмечайте выход на трансивер —\nиначе самоконтроль уйдёт в эфир.",
+                  foreground="#a60").grid(row=6 + len(names), column=0, **pad)
+
         f = ttk.LabelFrame(w, text="Звонок при вызове на мой ID", padding=6)
-        f.grid(row=3, column=0, sticky="ew", padx=10, pady=4)
-        ttk.Checkbutton(f, text="Звонить", variable=v["ring"]).grid(row=0, column=0, **pad)
+        f.grid(row=2, column=1, rowspan=2, sticky="nsew", padx=10, pady=4)
+        ttk.Checkbutton(f, text="Звонить (на устройствах самоконтроля,\nесли не выбраны — системный выход)",
+                        variable=v["ring"]).grid(row=0, column=0, columnspan=3, **pad)
         ttk.Label(f, text="Сигнал").grid(row=1, column=0, **pad)
         ttk.Combobox(f, textvariable=v["ring_style"], values=[t for _, t in RING_STYLES], state="readonly",
                      width=26).grid(row=1, column=1, columnspan=2, **pad)
-        ttk.Label(f, text="Куда").grid(row=2, column=0, **pad)
-        ttk.Combobox(f, textvariable=v["ring_dev"], values=app.dev_out_names, state="readonly",
-                     width=26).grid(row=2, column=1, columnspan=2, **pad)
-        ttk.Label(f, text="Громкость").grid(row=3, column=0, **pad)
-        ttk.Scale(f, from_=0.05, to=1.0, variable=v["ring_vol"], length=160).grid(row=3, column=1, **pad)
-        ttk.Button(f, text="Прослушать", command=self.test_ring).grid(row=3, column=2, **pad)
-        ttk.Label(f, text="Звонить не дольше, с").grid(row=4, column=0, **pad)
-        ttk.Spinbox(f, from_=5, to=300, increment=5, textvariable=v["ring_sec"], width=6).grid(row=4, column=1, **pad)
+        ttk.Label(f, text="Громкость").grid(row=2, column=0, **pad)
+        ttk.Scale(f, from_=0.05, to=1.0, variable=v["ring_vol"], length=120).grid(row=2, column=1, **pad)
+        ttk.Button(f, text="Прослушать", command=self.test_ring).grid(row=2, column=2, **pad)
+        ttk.Label(f, text="Не дольше, с").grid(row=3, column=0, **pad)
+        ttk.Spinbox(f, from_=5, to=300, increment=5, textvariable=v["ring_sec"], width=6).grid(row=3, column=1, **pad)
 
         b = ttk.Frame(w, padding=(10, 8))
-        b.grid(row=4, column=0, sticky="ew")
+        b.grid(row=4, column=0, columnspan=2, sticky="ew")
         ttk.Button(b, text="Очистить журнал", command=self.clear_log).pack(side="left")
         ttk.Button(b, text="Готово", command=self.close).pack(side="right")
         w.protocol("WM_DELETE_WINDOW", self.close)
         w.grab_set()
+
+    @staticmethod
+    def ports():
+        return [d for d, _ in PTT.list_ports()]
+
+    def on_method(self):
+        m = next((k for k, t in PTT_TITLES.items() if t == self.v["ptt_method"].get()), "none")
+        self.v["ptt_baud"].set(str(PTT.DEFAULT_BAUD.get(m, 9600)))
+
+    def on_icom(self):
+        a = PTT.ICOM_MODELS.get(self.v["icom_model"].get())
+        if a:
+            self.v["icom_addr"].set("%02X" % a)
 
     def _num(self, var, lo, hi, default):
         try:
@@ -1041,8 +1150,17 @@ class SettingsWindow:
         s["dot_seconds"] = self._num(v["dot"], 0.4, 12, 6.0)
         s["tx_level"] = self._num(v["level"], 0.05, 1.0, 0.5)
         s["translit"] = bool(v["translit"].get())
-        s["ptt_mode"] = next((k for k, t in PTT_MODES if t == v["ptt_mode"].get()), "vox")
+        s["ptt_method"] = next((k for k, t in PTT_TITLES.items() if t == v["ptt_method"].get()), "none")
         s["ptt_port"] = v["ptt_port"].get().strip()
+        s["ptt_baud"] = int(self._num(v["ptt_baud"], 300, 115200, 9600))
+        s["ptt_invert"] = bool(v["ptt_invert"].get())
+        s["ptt_icom_model"] = v["icom_model"].get()
+        s["ptt_icom_addr"] = v["icom_addr"].get().strip() or "94"
+        s["ptt_kenwood"] = v["kenwood"].get() or "TX;"
+        s["mon_rx"] = bool(v["mon_rx"].get())
+        s["mon_tx"] = bool(v["mon_tx"].get())
+        s["mon_level"] = self._num(v["mon_level"], 0.0, 1.0, 0.5)
+        s["mon_devs"] = [n for n, bv in self.mon_vars.items() if bv.get()]
         s["ptt_delay"] = self._num(v["ptt_delay"], 0, 3, 0.5)
         s["ptt_tail"] = self._num(v["ptt_tail"], 0, 2, 0.3)
         s["mute_rx_on_tx"] = bool(v["mute"].get())
@@ -1051,17 +1169,17 @@ class SettingsWindow:
         s["show_all"] = bool(v["show_all"].get())
         s["ring"] = bool(v["ring"].get())
         s["ring_style"] = next((k for k, t in RING_STYLES if t == v["ring_style"].get()), "codan")
-        rd = v["ring_dev"].get()
-        s["ring_dev"] = "" if rd == "По умолчанию" else rd
         s["ring_volume"] = self._num(v["ring_vol"], 0.05, 1.0, 0.5)
         s["ring_seconds"] = self._num(v["ring_sec"], 5, 300, 30)
         self.app.core.save()
-        try:
-            self.app.core.reopen_ptt()
-        except Exception as ex:
-            self.app.add("PTT: %s" % ex, "error")
-        if s["ring_dev"] == s["out_dev"]:
-            self.app.add("Звонок и передача идут на одно устройство: звонок может уйти в трансивер.", "error")
+        err = self.app.core.reopen_ptt()
+        if err:
+            self.app.add("PTT: %s" % err, "error")
+        for e in self.app.core.apply_monitor():
+            self.app.add("Самоконтроль: %s" % e, "error")
+        if s["out_dev"] and s["out_dev"] in s["mon_devs"]:
+            self.app.add("Выход на трансивер отмечен в самоконтроле: звук самоконтроля и звонок уйдут в эфир!",
+                         "error")
 
     def test_ptt(self):
         self.apply()
@@ -1123,7 +1241,22 @@ def selftest(out_path):
         ok = ok and good
     pat = ring_pattern("codan", 48000, 0.5)
     log("ring pattern: %s" % ("OK" if len(pat) > 0 and np.abs(pat).max() <= 0.51 else "FAIL"))
-    log("serial ports: %s" % (SerialPTT.ports() or "нет"))
+    cat = [PTT.command_bytes("ICOM", True, 0x94), PTT.command_bytes("YAESU", True),
+           PTT.command_bytes("YAESU-OLD", False), PTT.command_bytes("KENWOOD", False)]
+    good = cat == [bytes([0xFE, 0xFE, 0x94, 0xE0, 0x1C, 0x00, 0x01, 0xFD]), b"TX1;", bytes([0, 0, 0, 0, 0x88]), b"RX;"]
+    log("CAT commands: %s" % ("OK" if good else "FAIL %r" % cat))
+    ok = ok and good
+    m = Monitor()
+    o = dict(fs=48000, buf=np.zeros(0, np.float32), lock=threading.Lock())
+    m.outs["test"] = o
+    m.feed(np.ones(4000, np.float32))
+    out = np.zeros((1000, 1), np.float32)
+    m.level = 0.25
+    m._cb(o)(out, 1000, None, None)
+    good = len(o["buf"]) == int(0.5 * 48000) - 1000 and abs(out[500, 0] - 0.25) < 1e-6
+    log("monitor buffer/level: %s" % ("OK" if good else "FAIL"))
+    ok = ok and good
+    log("serial ports: %s" % ([d for d, _ in PTT.list_ports()] or "нет"))
     if sd is not None:
         try:
             log("audio devices (MME): %d" % len(list_devices()))

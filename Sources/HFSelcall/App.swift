@@ -262,11 +262,11 @@ struct SettingsView: View {
                     }
                     Toggle("Транслитерировать кириллицу в сообщениях", isOn: $m.transliterate)
                 }
-                Section("Трансивер (PTT)") {
-                    Picker("Управление передачей", selection: $m.pttMode) {
-                        ForEach(PTTMode.allCases) { Text($0.title).tag($0) }
+                Section("Управление передачей (PTT / CAT)") {
+                    Picker("Метод", selection: $m.pttMethod) {
+                        ForEach(PTTMethod.allCases) { Text($0.title).tag($0) }
                     }
-                    if m.pttMode.usesPort {
+                    if m.pttMethod.usesPort {
                         HStack {
                             Picker("Порт", selection: $m.pttPort) {
                                 Text("— не выбран —").tag("")
@@ -274,9 +274,33 @@ struct SettingsView: View {
                             }
                             Button { m.refreshDevices() } label: { Image(systemName: "arrow.clockwise") }
                                 .help("Обновить список портов")
-                            Button("Проверить") { m.testPTT() }
-                                .help("Включить передачу на 1 с")
                         }
+                        Picker("Скорость", selection: $m.pttBaud) {
+                            ForEach(PTTCat.bauds, id: \.self) { Text("\($0)").tag($0) }
+                        }
+                        if m.pttMethod.isLine {
+                            Toggle("Инверсия линии", isOn: $m.pttInvert)
+                        }
+                        if m.pttMethod == .icom {
+                            HStack {
+                                Picker("Модель ICOM", selection: $m.icomModel) {
+                                    ForEach(PTTCat.icomModels, id: \.name) { Text($0.name).tag($0.name) }
+                                }
+                                Text("CI-V")
+                                TextField("94", text: $m.icomAddr)
+                                    .frame(width: 50)
+                                    .font(.system(.body, design: .monospaced))
+                            }
+                        }
+                        if m.pttMethod == .kenwood || m.pttMethod == .elecraft {
+                            Picker("Команда TX", selection: $m.kenwoodVariant) {
+                                ForEach(PTTCat.kenwoodVariants, id: \.self) { Text($0).tag($0) }
+                            }
+                        }
+                        Button("Тест PTT (1 с)") { m.testPTT() }
+                            .help("Включить передачу на 1 с без звука — лучше на эквивалент нагрузки")
+                        Text("CAT-команды составлены по документации производителей и на трансиверах не проверялись.")
+                            .font(.caption).foregroundStyle(.secondary)
                     }
                     HStack {
                         Text("Задержка PTT/VOX → сигнал")
@@ -294,14 +318,30 @@ struct SettingsView: View {
                          : "Приём работает и во время передачи; свой сигнал попадёт в журнал как «Своя передача (эхо)».")
                         .font(.caption).foregroundStyle(.secondary)
                 }
+                Section("Самоконтроль (можно несколько устройств)") {
+                    Toggle("Слушать эфир (вход)", isOn: $m.monitorRX)
+                    Toggle("Слушать свою передачу", isOn: $m.monitorTX)
+                    HStack {
+                        Text("Уровень самоконтроля")
+                        Slider(value: $m.monitorLevel, in: 0...1)
+                        Text(String(format: "%.0f%%", m.monitorLevel * 100)).monospacedDigit().frame(width: 44)
+                    }
+                    ForEach(m.outputDevices) { d in
+                        Toggle(d.name, isOn: Binding(get: { m.isMonitorDevice(d) },
+                                                     set: { m.setMonitorDevice(d, $0) }))
+                    }
+                    if m.monitorDevices.contains(where: { n in m.outputDevices.first(where: { $0.id == m.outputDevice })?.name == n }) {
+                        Text("Отмечен выход на трансивер: самоконтроль и звонок уйдут в эфир!")
+                            .font(.caption).foregroundStyle(.red)
+                    } else {
+                        Text("Например, динамики ноутбука, когда трансивер подключён к внешней звуковой карте.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
                 Section("Звонок при вызове на мой ID") {
                     Toggle("Звонить", isOn: $m.ringEnabled)
                     Picker("Сигнал", selection: $m.ringStyle) {
                         ForEach(RingStyle.allCases) { Text($0.title).tag($0) }
-                    }
-                    Picker("Куда", selection: $m.ringDevice) {
-                        Text("Системный выход").tag(AudioDeviceID(0))
-                        ForEach(m.outputDevices) { Text($0.name).tag($0.id) }
                     }
                     HStack {
                         Text("Громкость")
@@ -313,10 +353,9 @@ struct SettingsView: View {
                         Spacer()
                         Stepper(String(format: "%.0f с", m.ringSeconds), value: $m.ringSeconds, in: 5...300, step: 5)
                     }
-                    if m.ringDevice == m.outputDevice {
-                        Text("Звонок и передача идут на одно устройство: звонок может уйти в трансивер.")
-                            .font(.caption).foregroundStyle(.orange)
-                    }
+                    Text(m.monitorDevices.isEmpty ? "Звонок звучит на системном выходе Mac."
+                                                  : "Звонок звучит на устройствах самоконтроля.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
                 Section("Приём") {
                     Toggle("Автоподстройка частоты (АПЧ)", isOn: $m.autoAFC)
@@ -338,7 +377,7 @@ struct SettingsView: View {
             }
         }
         .padding(20)
-        .frame(width: 560, height: 680)
+        .frame(width: 600, height: 760)
     }
 }
 
