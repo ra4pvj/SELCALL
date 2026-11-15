@@ -236,7 +236,7 @@ public enum Selcall {
             taken.append(c.pos)
             if var call = extract(sym, c.pos) {
                 call.endBit += c.pos
-                out.append(Found(pos: max(0, c.pos - 230), score: c.score, call: call))
+                out.append(Found(pos: c.pos, score: c.score, call: call))   // pos — якорь RX0 (точная метка)
             }
         }
         return out
@@ -346,7 +346,9 @@ public enum Selcall {
                 let bits = inv ? raw.map { 1 - $0 } : raw
                 for f in findCalls(bits: bits) {
                     var c = f.call
-                    c.time = Double(idx[f.pos]) / fs
+                    // время начала фазировки = якорь − 2,3 с; без обрезки по краю окна,
+                    // иначе при сдвиге окна время «плыло» и вызов выдавался повторно
+                    c.time = Double(idx[f.pos]) / fs - 2.3
                     c.endTime = Double(idx[min(idx.count - 1, max(0, c.endBit))]) / fs
                     c.center = center
                     c.inverted = inv

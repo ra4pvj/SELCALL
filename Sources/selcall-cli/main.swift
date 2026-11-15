@@ -102,6 +102,11 @@ case "selftest":
     }
     rx.append([Float](repeating: 0, count: 16000))
     got += rx.process(flush: true)
+    // ещё 90 с тишины: окно приёмника (60 с) уезжает за вызовы — повторов быть не должно
+    for k in 0..<90 {
+        rx.append([Float](repeating: 0, count: 8000))
+        if k % 2 == 1 { got += rx.process() }
+    }
     let streamOK = got.count == tests.count && got.allSatisfy { $0.eccOK }
     print("stream decode:", streamOK ? "OK" : "FAIL (\(got.count) calls)")
     got.forEach { print("  ", $0.summary) }

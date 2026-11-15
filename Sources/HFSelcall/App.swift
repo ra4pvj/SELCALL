@@ -389,12 +389,7 @@ struct SettingsView: View {
                     }
                     Toggle("Звонок в эфир — ответ вызывающей станции (как CODAN / Vertex)", isOn: $m.ringOnAir)
                     if m.ringOnAir {
-                        HStack {
-                            Text("Повторов в эфир")
-                            Spacer()
-                            Stepper("\(m.ringOnAirRepeats)", value: $m.ringOnAirRepeats, in: 1...10)
-                        }
-                        Text("Через 1 с после принятого вызова включается PTT и звонок передаётся на выход трансивера "
+                        Text("Через 1 с после принятого вызова передатчик включается ровно на 5 с и передаёт звонок "
                              + "с уровнем передачи. На подтверждения (ACK) не отвечает.")
                             .font(.caption).foregroundStyle(.secondary)
                     }

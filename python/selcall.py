@@ -211,7 +211,7 @@ def _find_calls_in_bits(bits):
         res = _extract(sym, int(p))
         if res:
             res["endbit"] = int(p) + res.pop("_endrel")
-            res["bitpos"] = max(0, int(p) - 230)          # примерно начало фазировки
+            res["bitpos"] = int(p)                         # якорь RX0 (точная метка)
             res["phasing_score"] = int(score[p])
             calls.append(res)
     return calls
@@ -332,7 +332,9 @@ def _decode_at(x, fs, center):
         raw = d[idx] > 0
         for bits, pol in ((raw, "normal"), (~raw, "inverted")):
             for c in _find_calls_in_bits(bits.astype(np.uint8)):
-                c["time"] = idx[c["bitpos"]] / fs
+                # начало фазировки = якорь − 2,3 с; без обрезки по краю окна (иначе при сдвиге
+                # окна время «плыло» и потоковый приёмник выдавал тот же вызов повторно)
+                c["time"] = idx[c["bitpos"]] / fs - 2.3
                 c["end_time"] = idx[min(len(idx) - 1, c.pop("endbit"))] / fs
                 c["polarity"] = pol
                 c["center_hz"] = round(center, 1)
@@ -363,12 +365,14 @@ class StreamReceiver:
         self.afc_seconds = afc_seconds
         self.fixed_center = None
         self.last_centers = []
+        self.repeat_window = 120.0
         self.reset()
 
     def reset(self):
         self.buf = np.zeros(0, dtype=np.float32)
         self.base = 0
         self.reported = []
+        self.recent = {}            # (от, кому, текст, EOS) -> время: повтор в течение repeat_window не выдаётся
 
     @property
     def now(self):
@@ -404,6 +408,10 @@ class StreamReceiver:
             abs_t = t0 + c["time"]
             if any(abs(r - abs_t) < 1.0 for r in self.reported):
                 continue
+            key = (c["from"], c["to"], c["message"], c["eos"])
+            prev = self.recent.get(key)
+            if prev is not None and abs(abs_t - prev) < self.repeat_window:
+                continue
             # нет символа после EOS: ждём 1,5 с (EOS мог оказаться буквой текста)
             if not c["complete"] and not flush and end - (t0 + c["end_time"]) < 1.5:
                 continue
@@ -412,8 +420,11 @@ class StreamReceiver:
             c["time"] = abs_t
             c["end_time"] += t0
             self.reported.append(abs_t)
+            if c["ecc_ok"]:
+                self.recent[key] = abs_t
             out.append(c)
         self.reported = [r for r in self.reported if r > t0 - 5]
+        self.recent = {k: v for k, v in self.recent.items() if end - v < self.repeat_window + 60}
         return out
 
 
@@ -496,6 +507,10 @@ def selftest():
             got += rx.process()
     rx.append(np.zeros(16000))
     got += rx.process(flush=True)
+    for i in range(0, 8000 * 70, 800):                 # ещё 70 с тишины: окно уезжает, повторов быть не должно
+        rx.append(np.zeros(800))
+        if (i // 800) % 10 == 9:
+            got += rx.process()
     stream_ok = len(got) == len(tests) and all(c["ecc_ok"] for c in got)
     print("stream decode:", "OK" if stream_ok else "FAIL (%d)" % len(got))
     ok = ok and stream_ok

@@ -134,6 +134,10 @@ public final class Receiver {
     private var base = 0                       // абсолютный индекс buf[0]
     private let afc: AFC
     private var reported = [Double]()          // абсолютные времена выданных вызовов
+    /// Недавно выданные вызовы по содержимому (от, кому, текст, EOS) -> абсолютное время:
+    /// тот же вызов в течение `repeatWindow` секунд повторно не выдаётся.
+    private var recent = [String: Double]()
+    public var repeatWindow = 120.0
 
     public init(sampleRate: Double = 8000, windowSeconds: Double = 60) {
         fs = sampleRate
@@ -149,6 +153,7 @@ public final class Receiver {
         base = 0
         afc.reset()
         reported.removeAll()
+        recent.removeAll()
     }
 
     public func append(_ x: [Float]) {
@@ -180,15 +185,19 @@ public final class Receiver {
         for var c in calls {
             let absT = t0 + c.time
             if reported.contains(where: { abs($0 - absT) < 1.0 }) { continue }
+            let key = "\(c.from)|\(c.to)|\(c.message)|\(c.eos)"
+            if let prev = recent[key], absT - prev < repeatWindow, absT - prev > -repeatWindow { continue }
             // кадр без завершающего символа после EOS: ждём ещё 1,5 с (EOS мог оказаться буквой текста)
             if !c.complete && !flush && end - (t0 + c.endTime) < 1.5 { continue }
             if !c.eccOK && !flush && end - absT < 20 { continue }
             c.time = absT
             c.endTime += t0
             reported.append(absT)
+            if c.eccOK { recent[key] = absT }
             out.append(c)
         }
         reported.removeAll { $0 < t0 - 5 }
+        recent = recent.filter { end - $0.value < repeatWindow + 60 }
         return out
     }
 }
