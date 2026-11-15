@@ -81,7 +81,7 @@ jobs:
 
       - name: Version
         run: |
-          $v = git describe --tags --always
+          $v = git describe --tags --match "v*" --always
           "VERSION = '$v'" | Out-File -Encoding ascii windows/_version.py
           "Version: $v"
 
@@ -98,6 +98,8 @@ jobs:
           $sdd = python -c "import _sounddevice_data, os; print(os.path.dirname(_sounddevice_data.__file__))"
           $boot = python -c "import PyInstaller, os; print(os.path.join(os.path.dirname(PyInstaller.__file__), 'bootloader', '${{ matrix.boot }}'))"
           python windows/check_win7.py "$base\python38.dll" "$base\DLLs" $np $sdd $boot
+          # загрузчик exe стартует ДО распаковки встроенного UCRT — он не должен сам требовать UCRT
+          python -c "import pefile,sys; pe=pefile.PE(sys.argv[1]); d=sorted({e.dll.decode().lower() for e in pe.DIRECTORY_ENTRY_IMPORT}); print('bootloader imports:', d); bad=[x for x in d if x.startswith('api-ms-win-crt') or x in ('ucrtbase.dll','vcruntime140.dll')]; print('bootloader needs UCRT/VC runtime:', bad or 'no'); sys.exit(1 if bad else 0)" "$boot\runw.exe"
 
       - name: Build exe (PyInstaller 5.13, UCRT bundled for Win7 without KB2999226)
         working-directory: windows
