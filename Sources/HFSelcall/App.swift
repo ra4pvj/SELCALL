@@ -42,6 +42,7 @@ struct ContentView: View {
         VStack(spacing: 0) {
             topBar
             Divider()
+            if let e = m.incoming { IncomingBanner(entry: e) }
             LogView()
             Divider()
             composer
@@ -71,6 +72,7 @@ struct ContentView: View {
             Button { m.refreshDevices() } label: { Image(systemName: "arrow.clockwise") }
                 .help("Обновить список устройств")
             Spacer()
+            TxLamp(on: m.transmitting, keyed: m.pttKeyed)
             LevelMeter(level: m.level).frame(width: 90, height: 10)
             Text(afcText)
                 .font(.system(.caption, design: .monospaced))
@@ -259,7 +261,62 @@ struct SettingsView: View {
                         Text(String(format: "%.0f%%", m.txLevel * 100)).monospacedDigit().frame(width: 44)
                     }
                     Toggle("Транслитерировать кириллицу в сообщениях", isOn: $m.transliterate)
-                    Toggle("Автоматически подтверждать вызовы на мой ID (ACK)", isOn: $m.autoAck)
+                }
+                Section("Трансивер (PTT)") {
+                    Picker("Управление передачей", selection: $m.pttMode) {
+                        ForEach(PTTMode.allCases) { Text($0.title).tag($0) }
+                    }
+                    if m.pttMode.usesPort {
+                        HStack {
+                            Picker("Порт", selection: $m.pttPort) {
+                                Text("— не выбран —").tag("")
+                                ForEach(m.pttPorts, id: \.self) { Text($0).tag($0) }
+                            }
+                            Button { m.refreshDevices() } label: { Image(systemName: "arrow.clockwise") }
+                                .help("Обновить список портов")
+                            Button("Проверить") { m.testPTT() }
+                                .help("Включить передачу на 1 с")
+                        }
+                    }
+                    HStack {
+                        Text("Задержка PTT/VOX → сигнал")
+                        Spacer()
+                        Stepper(String(format: "%.1f с", m.pttDelay), value: $m.pttDelay, in: 0...3, step: 0.1)
+                    }
+                    HStack {
+                        Text("Хвост после сигнала")
+                        Spacer()
+                        Stepper(String(format: "%.1f с", m.pttTail), value: $m.pttTail, in: 0...2, step: 0.1)
+                    }
+                    Toggle("Не принимать во время передачи", isOn: $m.muteRxOnTx)
+                    Text(m.muteRxOnTx
+                         ? "На время передачи приём глушится, свой сигнал не декодируется."
+                         : "Приём работает и во время передачи; свой сигнал попадёт в журнал как «Своя передача (эхо)».")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Section("Звонок при вызове на мой ID") {
+                    Toggle("Звонить", isOn: $m.ringEnabled)
+                    Picker("Сигнал", selection: $m.ringStyle) {
+                        ForEach(RingStyle.allCases) { Text($0.title).tag($0) }
+                    }
+                    Picker("Куда", selection: $m.ringDevice) {
+                        Text("Системный выход").tag(AudioDeviceID(0))
+                        ForEach(m.outputDevices) { Text($0.name).tag($0.id) }
+                    }
+                    HStack {
+                        Text("Громкость")
+                        Slider(value: $m.ringVolume, in: 0.05...1.0)
+                        Button("Прослушать") { m.testRing() }
+                    }
+                    HStack {
+                        Text("Звонить не дольше")
+                        Spacer()
+                        Stepper(String(format: "%.0f с", m.ringSeconds), value: $m.ringSeconds, in: 5...300, step: 5)
+                    }
+                    if m.ringDevice == m.outputDevice {
+                        Text("Звонок и передача идут на одно устройство: звонок может уйти в трансивер.")
+                            .font(.caption).foregroundStyle(.orange)
+                    }
                 }
                 Section("Приём") {
                     Toggle("Автоподстройка частоты (АПЧ)", isOn: $m.autoAFC)
@@ -281,6 +338,44 @@ struct SettingsView: View {
             }
         }
         .padding(20)
-        .frame(width: 520, height: 520)
+        .frame(width: 560, height: 680)
+    }
+}
+
+struct TxLamp: View {
+    var on: Bool
+    var keyed: Bool
+    var body: some View {
+        HStack(spacing: 4) {
+            Circle()
+                .fill(on || keyed ? Color.red : Color.secondary.opacity(0.3))
+                .frame(width: 10, height: 10)
+            Text("TX").font(.caption.bold()).foregroundStyle(on || keyed ? Color.red : Color.secondary)
+        }
+        .help(keyed ? "PTT включён — идёт передача" : "Передача выключена")
+    }
+}
+
+struct IncomingBanner: View {
+    @EnvironmentObject var m: AppModel
+    let entry: LogEntry
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "bell.and.waves.left.and.right.fill")
+                .font(.title2)
+                .foregroundStyle(Color.orange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("\(entry.title) от \(entry.from)").font(.headline)
+                if !entry.text.isEmpty { Text(entry.text).lineLimit(2) }
+            }
+            Spacer()
+            Button("Ответить") { m.answerRing() }
+                .buttonStyle(.borderedProminent)
+                .help("Подставить ID в поле «Кому» и выключить звонок")
+            Button("Сбросить") { m.stopRing() }
+                .keyboardShortcut(.cancelAction)
+        }
+        .padding(10)
+        .background(Color.orange.opacity(0.15))
     }
 }

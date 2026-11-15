@@ -1,4 +1,4 @@
-// Состояние приложения: настройки, журнал, приём/передача, автоответ ACK.
+// Состояние приложения: настройки, журнал, приём/передача, PTT, звонок.
 
 import AppKit
 import AVFoundation
@@ -24,7 +24,18 @@ final class AppModel: ObservableObject {
     @Published var myID: String { didSet { defaults.set(myID, forKey: "myID") } }
     @Published var dotSeconds: Double { didSet { defaults.set(dotSeconds, forKey: "dotSeconds") } }
     @Published var txLevel: Double { didSet { defaults.set(txLevel, forKey: "txLevel") } }
-    @Published var autoAck: Bool { didSet { defaults.set(autoAck, forKey: "autoAck") } }
+    // трансивер (PTT)
+    @Published var pttMode: PTTMode { didSet { defaults.set(pttMode.rawValue, forKey: "pttMode"); reopenPTT() } }
+    @Published var pttPort: String { didSet { defaults.set(pttPort, forKey: "pttPort"); reopenPTT() } }
+    @Published var pttDelay: Double { didSet { defaults.set(pttDelay, forKey: "pttDelay") } }
+    @Published var pttTail: Double { didSet { defaults.set(pttTail, forKey: "pttTail") } }
+    @Published var muteRxOnTx: Bool { didSet { defaults.set(muteRxOnTx, forKey: "muteRxOnTx") } }
+    // звонок
+    @Published var ringEnabled: Bool { didSet { defaults.set(ringEnabled, forKey: "ringEnabled") } }
+    @Published var ringStyle: RingStyle { didSet { defaults.set(ringStyle.rawValue, forKey: "ringStyle") } }
+    @Published var ringDevice: AudioDeviceID { didSet { defaults.set(Int(ringDevice), forKey: "ringDev") } }
+    @Published var ringVolume: Double { didSet { defaults.set(ringVolume, forKey: "ringVolume") } }
+    @Published var ringSeconds: Double { didSet { defaults.set(ringSeconds, forKey: "ringSeconds") } }
     @Published var transliterate: Bool { didSet { defaults.set(transliterate, forKey: "translit") } }
     @Published var autoAFC: Bool { didSet { defaults.set(autoAFC, forKey: "autoAFC"); applyCenter() } }
     @Published var fixedCenter: Double { didSet { defaults.set(fixedCenter, forKey: "fixedCenter"); applyCenter() } }
@@ -44,6 +55,10 @@ final class AppModel: ObservableObject {
     @Published var transmitting = false
     @Published var inputDevices: [AudioDevice] = []
     @Published var outputDevices: [AudioDevice] = []
+    @Published var pttPorts: [String] = []
+    @Published var pttKeyed = false
+    /// Входящий вызов, по которому сейчас звонит звонок (баннер в окне).
+    @Published var incoming: LogEntry?
 
     private let defaults = UserDefaults.standard
     private let audio = AudioIO()
@@ -54,12 +69,24 @@ final class AppModel: ObservableObject {
     private var txReady = false
     private var muteUntil = Date.distantPast         // не декодировать собственную передачу
     private var txQueue: [(samples: [Float], entry: LogEntry)] = []
+    private let ptt = SerialPTT()
+    private let ringer = Ringer()
+    private var watchdog: DispatchWorkItem?
 
     init() {
         myID = defaults.string(forKey: "myID") ?? "1234"
         dotSeconds = defaults.object(forKey: "dotSeconds") as? Double ?? 6.0
         txLevel = defaults.object(forKey: "txLevel") as? Double ?? 0.5
-        autoAck = defaults.object(forKey: "autoAck") as? Bool ?? true
+        pttMode = PTTMode(rawValue: defaults.string(forKey: "pttMode") ?? "") ?? .vox
+        pttPort = defaults.string(forKey: "pttPort") ?? ""
+        pttDelay = defaults.object(forKey: "pttDelay") as? Double ?? 0.5
+        pttTail = defaults.object(forKey: "pttTail") as? Double ?? 0.3
+        muteRxOnTx = defaults.object(forKey: "muteRxOnTx") as? Bool ?? true
+        ringEnabled = defaults.object(forKey: "ringEnabled") as? Bool ?? true
+        ringStyle = RingStyle(rawValue: defaults.string(forKey: "ringStyle") ?? "") ?? .codan
+        ringDevice = AudioDeviceID(defaults.integer(forKey: "ringDev"))
+        ringVolume = defaults.object(forKey: "ringVolume") as? Double ?? 0.5
+        ringSeconds = defaults.object(forKey: "ringSeconds") as? Double ?? 30
         transliterate = defaults.object(forKey: "translit") as? Bool ?? true
         autoAFC = defaults.object(forKey: "autoAFC") as? Bool ?? true
         fixedCenter = defaults.object(forKey: "fixedCenter") as? Double ?? Selcall.defaultCenter
@@ -68,6 +95,12 @@ final class AppModel: ObservableObject {
         outputDevice = AudioDeviceID(defaults.integer(forKey: "outDev"))
         refreshDevices()
         audio.onSamples = { [weak self] x, peak in self?.onSamples(x, peak) }
+        reopenPTT()
+        NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification,
+                                               object: nil, queue: .main) { [weak self] _ in
+            self?.ptt.close()
+            self?.ringer.stop()
+        }
     }
 
     // MARK: устройства
@@ -78,6 +111,62 @@ final class AppModel: ObservableObject {
         outputDevices = all.filter { $0.outputs > 0 }
         if inputDevice != 0, !inputDevices.contains(where: { $0.id == inputDevice }) { inputDevice = 0 }
         if outputDevice != 0, !outputDevices.contains(where: { $0.id == outputDevice }) { outputDevice = 0 }
+        if ringDevice != 0, !outputDevices.contains(where: { $0.id == ringDevice }) { ringDevice = 0 }
+        pttPorts = SerialPTT.ports()
+    }
+
+    // MARK: PTT
+
+    private func reopenPTT() {
+        guard pttMode.usesPort else { ptt.close(); pttKeyed = false; return }
+        guard !pttPort.isEmpty else { ptt.close(); return }
+        do {
+            try ptt.open(pttPort)
+        } catch {
+            addError("PTT: \(error.localizedDescription)")
+        }
+    }
+
+    private func keyPTT(_ on: Bool) {
+        guard pttMode.usesPort else { pttKeyed = on; return }
+        do {
+            if !ptt.isOpen { try ptt.open(pttPort) }
+            try ptt.set(on, lines: pttMode.lines)
+            pttKeyed = on
+        } catch {
+            ptt.release()
+            pttKeyed = false
+            if on { addError("PTT: \(error.localizedDescription)") }
+        }
+    }
+
+    /// Проверка PTT: включить передачу на 1 секунду без сигнала.
+    func testPTT() {
+        guard !transmitting else { return }
+        guard pttMode.usesPort else { addInfo("Режим VOX: трансивер управляется звуком, проверять нечего"); return }
+        keyPTT(true)
+        guard pttKeyed else { return }
+        addInfo("Проверка PTT: \(pttPort), \(pttMode.title) — 1 с")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            guard let self = self, !self.transmitting else { return }
+            self.keyPTT(false)
+        }
+    }
+
+    // MARK: звонок
+
+    func stopRing() {
+        ringer.stop()
+        incoming = nil
+    }
+
+    func answerRing() {
+        if let e = incoming { toID = e.from }
+        stopRing()
+    }
+
+    func testRing() {
+        ringer.start(style: ringStyle, device: ringDevice, volume: ringVolume, seconds: 4)
     }
 
     // MARK: приём
@@ -146,6 +235,7 @@ final class AppModel: ObservableObject {
 
     private func handleRx(_ c: DecodedCall, date: Date, fromFile: Bool = false) {
         let mine = Selcall.digitsOnly(c.to) == Selcall.digitsOnly(myID).leftPadded(to: c.to.count)
+        let own = !fromFile && Selcall.digitsOnly(c.from) == Selcall.digitsOnly(myID).leftPadded(to: c.from.count)
         if !showAll && !mine && !fromFile { return }
         let title: String
         switch (c.isMessage, c.eos) {
@@ -156,11 +246,17 @@ final class AppModel: ObservableObject {
         let detail = String(format: "fmt %d · cat %d · %@ · ECC %@ · %@ · %.1f Гц%@%@",
                             c.format, c.category, c.eosName, c.ecc, c.eccOK ? "принят" : "СОМНИТЕЛЬНО", c.center,
                             c.inverted ? " · LSB" : "", c.conflicts > 0 ? " · исправлено \(c.conflicts)" : "")
-        log.append(LogEntry(date: date, kind: .rx, from: c.from, to: c.to,
-                            title: title + (mine ? " мне" : "") + (fromFile ? " (файл)" : ""),
-                            text: c.message, detail: detail, ok: c.eccOK))
-        if mine, autoAck, !fromFile, c.eccOK, c.eos == Selcall.eosAckRQ {
-            send(to: c.from, message: nil, eos: Selcall.eosAckBQ, title: "Автоответ ACK")
+        let entry = LogEntry(date: date, kind: .rx, from: c.from, to: c.to,
+                             title: own ? "Своя передача (эхо)" :
+                                 title + (mine ? " мне" : "") + (fromFile ? " (файл)" : ""),
+                             text: c.message, detail: detail, ok: c.eccOK)
+        log.append(entry)
+        if mine, !own, !fromFile, c.eccOK, c.eos != Selcall.eosAckBQ {
+            incoming = entry
+            NSApp.requestUserAttention(.criticalRequest)
+            if ringEnabled {
+                ringer.start(style: ringStyle, device: ringDevice, volume: ringVolume, seconds: ringSeconds)
+            }
         }
     }
 
@@ -201,8 +297,10 @@ final class AppModel: ObservableObject {
         }
         let text = prepared(message)
         let stream = Selcall.buildCall(to: to, from: myID, message: text, eos: eos)
-        let y = Selcall.modulate(stream, sampleRate: audio.outputRate, dotSeconds: dotSeconds,
-                                 amplitude: txLevel)
+        let rate = audio.outputRate
+        let y = [Float](repeating: 0, count: Int(pttDelay * rate))
+            + Selcall.modulate(stream, sampleRate: rate, dotSeconds: dotSeconds, amplitude: txLevel)
+            + [Float](repeating: 0, count: Int(pttTail * rate))
         let entry = LogEntry(date: Date(), kind: .tx, from: Selcall.digitsOnly(myID), to: Selcall.digitsOnly(to),
                              title: title, text: text ?? "",
                              detail: String(format: "%.1f с · %@", Double(y.count) / audio.outputRate,
@@ -212,24 +310,42 @@ final class AppModel: ObservableObject {
     }
 
     private func playNext() {
-        guard !txQueue.isEmpty else { transmitting = false; return }
+        guard !txQueue.isEmpty else { finishTx(); return }
         let item = txQueue.removeFirst()
         transmitting = true
         log.append(item.entry)
         let dur = Double(item.samples.count) / audio.outputRate
-        muteUntil = Date().addingTimeInterval(dur + 0.7)
+        if muteRxOnTx { muteUntil = Date().addingTimeInterval(dur + 1.0) }
+        keyPTT(true)
+        // страховка: PTT снимается, даже если звук «завис»
+        watchdog?.cancel()
+        let w = DispatchWorkItem { [weak self] in
+            guard let self = self, self.transmitting else { return }
+            self.addError("Передача не завершилась вовремя — PTT снят принудительно")
+            self.stopTx()
+        }
+        watchdog = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + dur + 5, execute: w)
         audio.play(item.samples) { [weak self] in
-            guard let self = self else { return }
-            self.muteUntil = Date().addingTimeInterval(0.5)
+            guard let self = self, self.transmitting else { return }
             self.playNext()
         }
+    }
+
+    private func finishTx() {
+        watchdog?.cancel()
+        watchdog = nil
+        keyPTT(false)
+        transmitting = false
+        if muteRxOnTx { muteUntil = Date().addingTimeInterval(0.5) }
     }
 
     func stopTx() {
         txQueue.removeAll()
         audio.stopTx()
         txReady = false
-        transmitting = false
+        finishTx()
+        ptt.release()
         muteUntil = Date()
     }
 
