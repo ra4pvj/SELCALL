@@ -138,8 +138,59 @@ jobs:
           path: HFSelcall-Windows-${{ matrix.arch }}.zip
           if-no-files-found: error
 
+  linux:
+    runs-on: ubuntu-22.04          # старый glibc 2.35 — запускается на большинстве современных дистрибутивов
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libportaudio2
+          python -m pip install "numpy<2" "sounddevice==0.4.6" "pyserial==3.5" "pyinstaller==6.11.1"
+          echo "VERSION = 'v$(tr -d ' \r\n' < VERSION)+$(git rev-parse --short HEAD)'" > windows/_version.py
+
+      - name: Self-test from source
+        run: |
+          python python/selcall.py selftest
+          python windows/hfselcall_win.py --selftest
+
+      - name: Build (PyInstaller onedir)
+        working-directory: windows
+        run: |
+          python -m PyInstaller --noconfirm --onedir --windowed --name HFSelcall \
+            --paths ../python --collect-all sounddevice \
+            --hidden-import selcall_ptt --hidden-import serial.tools.list_ports \
+            hfselcall_win.py
+          ./dist/HFSelcall/HFSelcall --selftest
+          cat dist/HFSelcall/selftest.txt && rm dist/HFSelcall/selftest.txt
+
+      - name: Package
+        run: |
+          cp windows/README_WINDOWS.txt windows/dist/HFSelcall/README.txt
+          cat > windows/dist/HFSelcall/README_LINUX.txt <<'EOF'
+          HF Selcall для Linux (x86_64, glibc 2.35+: Ubuntu 22.04+, Debian 12+, Mint 21+ и т.п.)
+          Нужна системная библиотека PortAudio:  sudo apt install libportaudio2
+          Запуск: распакуйте архив, ./HFSelcall/HFSelcall
+          COM-порт для PTT/CAT: /dev/ttyUSB0, /dev/ttyACM0 — пользователь должен быть в группе dialout
+          (sudo usermod -aG dialout $USER, затем перелогиниться).
+          Остальное — как в README.txt (версия для Windows; интерфейс тот же).
+          EOF
+          sed -i 's/^          //' windows/dist/HFSelcall/README_LINUX.txt
+          tar -C windows/dist -czf HFSelcall-Linux-x64.tar.gz HFSelcall
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: linux
+          path: HFSelcall-Linux-x64.tar.gz
+          if-no-files-found: error
+
   release:
-    needs: [macos, windows]
+    needs: [macos, windows, linux]
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
@@ -162,6 +213,8 @@ jobs:
 
           **Windows 7 SP1 / 8 / 10 / 11**: HFSelcall-Windows-x64.zip (64-бит) или HFSelcall-Windows-x86.zip (32-бит; для 32-битной Windows 7). Распакуйте архив целиком (папка HFSelcall) и запустите HFSelcall.exe внутри, установка не нужна. На Windows 7 нужен SP1 и обновление KB2533623 (обычно уже есть); UCRT уже лежит в папке программы. SmartScreen: «Подробнее» → «Выполнить в любом случае».
 
+          **Linux** x86_64 (Ubuntu 22.04+, Debian 12+ …): HFSelcall-Linux-x64.tar.gz; нужна libportaudio2 (sudo apt install libportaudio2).
+
           selcall-cli-macOS.zip — консольный кодер/декодер для macOS."
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             TAG="${GITHUB_REF#refs/tags/}"
@@ -174,5 +227,11 @@ jobs:
             if ! gh release view "$TAG" -R "$REPO" >/dev/null 2>&1; then
               gh release create "$TAG" dist/* -R "$REPO" --target "$GITHUB_SHA" --latest \
                 --title "HF Selcall $TAG" --notes "$NOTES"
+            else
+              # релиз версии уже есть: дописываем только недостающие файлы (новые платформы), не перезаписывая
+              have=$(gh release view "$TAG" -R "$REPO" --json assets --jq '.assets[].name')
+              for f in dist/*; do
+                grep -qxF "$(basename "$f")" <<< "$have" || gh release upload "$TAG" "$f" -R "$REPO"
+              done
             fi
           fi
