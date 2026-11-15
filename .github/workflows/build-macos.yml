@@ -9,7 +9,7 @@ jobs:
   build:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Toolchain
         run: |
@@ -22,10 +22,11 @@ jobs:
 
       - name: Python reference self-test
         run: |
-          python3 -m pip install --quiet numpy
-          python3 python/selcall.py selftest
+          python3 -m venv .venv
+          .venv/bin/pip install --quiet numpy
+          .venv/bin/python python/selcall.py selftest
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: HFSelcall-macOS
           path: |

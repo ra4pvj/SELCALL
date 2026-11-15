@@ -7,3 +7,4 @@ __pycache__/
 *.wav
 .DS_Store
 !testdata/*.wav
+.venv/
