@@ -7,15 +7,30 @@ import Foundation
 import ObjCSafe
 
 enum RingStyle: String, CaseIterable, Identifiable {
-    case codan, vertex, beep
+    case codan, vertex, beep, kalinka
     var id: String { rawValue }
     var title: String {
         switch self {
         case .codan: return "Двухтональный (как CODAN)"
         case .vertex: return "Трель (как Vertex)"
         case .beep: return "Короткие гудки"
+        case .kalinka: return "Мелодия «Калинка»"
         }
     }
+}
+
+/// Припев «Калинки» (И. Ларионов, 1860; общественное достояние), ля минор:
+/// «Эх, калинка, калинка, калинка моя» — ми ре | си до ре | си до ре | до си ля
+/// «В саду ягода-малинка, малинка моя» — ми ми ре до | си до ре | си до ре | до си ля
+/// (частота, Гц; длительность в восьмых). Обе строки ≈ 4,1 с — укладываются в 5 с ответа в эфир.
+enum Kalinka {
+    static let E5 = 659.26, D5 = 587.33, C5 = 523.25, B4 = 493.88, A4 = 440.0
+    static let eighth = 0.12
+    static let notes: [(Double, Double)] = [
+        (E5, 1), (D5, 1),  (B4, 1), (C5, 1), (D5, 2),  (B4, 1), (C5, 1), (D5, 2),  (C5, 1), (B4, 1), (A4, 4),
+        (E5, 1), (E5, 1), (D5, 1), (C5, 1),  (B4, 1), (C5, 1), (D5, 2),  (B4, 1), (C5, 1), (D5, 2),
+        (C5, 1), (B4, 1), (A4, 4),
+    ]
 }
 
 /// Звонок при вызове на свой ID — повторяющиеся сигналы, как у трансиверов CODAN / Vertex Standard.
@@ -51,6 +66,21 @@ final class Ringer {
         case .beep:    // три гудка
             for _ in 0..<3 { tone(1200, 0.15); silence(0.1) }
             silence(1.0)
+        case .kalinka: // мелодия: нота с мягкой атакой и затуханием, лёгкая вторая гармоника
+            for (f, n) in Kalinka.notes {
+                let dur = n * Kalinka.eighth
+                let len = Int((dur - 0.015) * fs)
+                for i in 0..<max(0, len) {
+                    let t = Double(i) / fs
+                    let att = min(1, t / 0.006)
+                    let dec = exp(-1.8 * t / dur)
+                    let rel = min(1, Double(len - 1 - i) / (0.006 * fs))
+                    let a = volume * att * dec * rel
+                    out.append(Float(a * (0.85 * sin(2 * Double.pi * f * t) + 0.15 * sin(4 * Double.pi * f * t))))
+                }
+                silence(0.015)
+            }
+            silence(0.8)
         }
         return out
     }

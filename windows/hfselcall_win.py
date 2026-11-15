@@ -85,7 +85,17 @@ PTT_TITLES = {"none": "нет (VOX / внешний PTT)", "RTS": "RTS", "DTR": 
               "KENWOOD": "KENWOOD (TX;/RX;)", "ELECRAFT": "ELECRAFT (TX;/RX;)"}
 IN_CHANNELS = ["Авто (где есть сигнал)", "1 (левый)", "2 (правый)"]
 RING_STYLES = [("codan", "Двухтональный (как CODAN)"), ("vertex", "Трель (как Vertex)"),
-               ("beep", "Короткие гудки")]
+               ("beep", "Короткие гудки"), ("kalinka", "Мелодия «Калинка»")]
+
+# Припев «Калинки» (И. Ларионов, 1860; общественное достояние), ля минор:
+# «Эх, калинка, калинка, калинка моя» — ми ре | си до ре | си до ре | до си ля
+# «В саду ягода-малинка, малинка моя» — ми ми ре до | си до ре | си до ре | до си ля
+# (частота, Гц; длительность в восьмых). Обе строки ≈ 4,1 с — укладываются в 5 с ответа в эфир.
+_E5, _D5, _C5, _B4, _A4 = 659.26, 587.33, 523.25, 493.88, 440.0
+KALINKA_EIGHTH = 0.12
+KALINKA = [(_E5, 1), (_D5, 1), (_B4, 1), (_C5, 1), (_D5, 2), (_B4, 1), (_C5, 1), (_D5, 2), (_C5, 1), (_B4, 1), (_A4, 4),
+           (_E5, 1), (_E5, 1), (_D5, 1), (_C5, 1), (_B4, 1), (_C5, 1), (_D5, 2), (_B4, 1), (_C5, 1), (_D5, 2),
+           (_C5, 1), (_B4, 1), (_A4, 4)]
 
 TRANSLIT = dict(zip("АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдеёжзийклмнопрстуфхцчшщъыьэюя№",
                     ["A", "B", "V", "G", "D", "E", "E", "ZH", "Z", "I", "J", "K", "L", "M", "N", "O", "P",
@@ -255,7 +265,16 @@ def ring_pattern(style, fs, volume):
     def silence(sec):
         out.append(np.zeros(int(sec * fs)))
 
-    if style == "vertex":
+    if style == "kalinka":
+        for f, n in KALINKA:
+            dur = n * KALINKA_EIGHTH
+            m = int((dur - 0.015) * fs)
+            t = np.arange(m) / fs
+            env = np.minimum(1, t / 0.006) * np.exp(-1.8 * t / dur) * np.minimum(1, (m - 1 - np.arange(m)) / (0.006 * fs))
+            out.append(volume * env * (0.85 * np.sin(2 * np.pi * f * t) + 0.15 * np.sin(4 * np.pi * f * t)))
+            silence(0.015)
+        silence(0.8)
+    elif style == "vertex":
         for _ in range(2):
             for _ in range(10):
                 tone(1500, 0.025)
@@ -1351,6 +1370,11 @@ def selftest(out_path):
         good = abs(len(a) / fs_ - RING_AIR_SECONDS) < 0.01 and abs(float(np.abs(a).max()) - DEFAULTS["tx_level"]) < 0.01
         log("ring on air (5 s total, TX level): %s (%.2f s)" % ("OK" if good else "FAIL", len(a) / fs_))
         ok = ok and good
+    k = ring_pattern("kalinka", 8000, 0.5)
+    melody = (len(k) / 8000.0) - 0.8
+    good = 3.8 < melody < 4.3 and np.abs(k).max() <= 0.5
+    log("kalinka melody: %s (%.2f s + pause)" % ("OK" if good else "FAIL", melody))
+    ok = ok and good
     pat = ring_pattern("codan", 48000, 0.5)
     log("ring pattern: %s" % ("OK" if len(pat) > 0 and np.abs(pat).max() <= 0.51 else "FAIL"))
     cat = [PTT.command_bytes("ICOM", True, 0x94), PTT.command_bytes("YAESU", True),
