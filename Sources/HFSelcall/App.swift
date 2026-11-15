@@ -20,7 +20,21 @@ struct HFSelcallApp: App {
             CommandGroup(replacing: .newItem) {
                 Button("Открыть запись…") { model.openWAV() }.keyboardShortcut("o")
             }
+            CommandGroup(replacing: .appSettings) { SettingsMenuButton() }
         }
+        // Настройки — отдельное окно (а не лист поверх главного): открывается повторно
+        // сколько угодно раз и может оставаться открытым во время работы
+        Window("Настройки HF Selcall", id: "settings") {
+            SettingsView().environmentObject(model)
+        }
+        .windowResizability(.contentMinSize)
+    }
+}
+
+struct SettingsMenuButton: View {
+    @Environment(\.openWindow) private var openWindow
+    var body: some View {
+        Button("Настройки…") { openWindow(id: "settings") }.keyboardShortcut(",")
     }
 }
 
@@ -36,7 +50,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 struct ContentView: View {
     @EnvironmentObject var m: AppModel
-    @State private var showSettings = false
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         VStack(spacing: 0) {
@@ -47,7 +61,6 @@ struct ContentView: View {
             Divider()
             composer
         }
-        .sheet(isPresented: $showSettings) { SettingsView().environmentObject(m) }
     }
 
     private var topBar: some View {
@@ -81,7 +94,7 @@ struct ContentView: View {
             Button(m.receiving ? "Стоп приём" : "Приём") { m.toggleRx() }
                 .tint(m.receiving ? .red : .accentColor)
                 .buttonStyle(.borderedProminent)
-            Button { showSettings = true } label: { Image(systemName: "gearshape") }
+            Button { openWindow(id: "settings") } label: { Image(systemName: "gearshape") }
                 .help("Настройки")
         }
         .padding(10)
@@ -241,7 +254,6 @@ struct LevelMeter: View {
 
 struct SettingsView: View {
     @EnvironmentObject var m: AppModel
-    @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -373,11 +385,11 @@ struct SettingsView: View {
             HStack {
                 Button("Очистить журнал") { m.clearLog() }
                 Spacer()
-                Button("Готово") { dismiss() }.keyboardShortcut(.defaultAction)
+                Button("Готово") { NSApp.keyWindow?.close() }.keyboardShortcut(.defaultAction)
             }
         }
         .padding(20)
-        .frame(width: 600, height: 760)
+        .frame(minWidth: 560, idealWidth: 600, minHeight: 420, idealHeight: 720)
     }
 }
 
