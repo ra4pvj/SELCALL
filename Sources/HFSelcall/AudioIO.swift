@@ -97,8 +97,14 @@ final class AudioIO {
     private var player: AVAudioPlayerNode?
     private var txRate: Double = 48000
 
-    /// Вызывается с аудиопотока: моно-отсчёты 8 кГц и пиковый уровень.
+    /// Вызывается с аудиопотока: моно-отсчёты 8 кГц и пиковый уровень выбранного канала (0…1).
     var onSamples: (([Float], Float) -> Void)?
+    /// Канал входа: 0 — авто (канал с сигналом), 1, 2, … — номер канала устройства.
+    var inputChannel = 0
+    /// Какой канал реально используется (1…), и сколько каналов у входа.
+    private(set) var activeChannel = 1
+    private(set) var inputChannels = 1
+    private var chEnergy = [Double]()
 
     static func requestMicAccess(_ done: @escaping (Bool) -> Void) {
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
@@ -136,24 +142,60 @@ final class AudioIO {
         guard hw.sampleRate > 0, hw.channelCount > 0 else { throw AudioIOError.noInput }
         guard let inFmt = AVAudioFormat(standardFormatWithSampleRate: hw.sampleRate, channels: hw.channelCount),
               let outFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: Self.rxRate,
-                                         channels: 1, interleaved: false),
-              let conv = AVAudioConverter(from: inFmt, to: outFmt) else { throw AudioIOError.converter }
+                                         channels: 1, interleaved: false) else { throw AudioIOError.converter }
+        inputChannels = Int(hw.channelCount)
+        chEnergy = [Double](repeating: 0, count: inputChannels)
+        // Берём ОДИН канал, а не среднее всех: у стерео-интерфейса (Scarlett и т.п.) трансивер обычно
+        // подключён к одному входу, и усреднение с пустым каналом занижало сигнал вдвое.
+        var conv: AVAudioConverter?
+        var monoFmt: AVAudioFormat?
         let tap: AVAudioNodeTapBlock = { [weak self] buf, _ in
-            guard let self = self else { return }
-            let cap = AVAudioFrameCount(Double(buf.frameLength) * Self.rxRate / inFmt.sampleRate) + 64
+            guard let self = self, let src = buf.floatChannelData, buf.frameLength > 0 else { return }
+            let n = Int(buf.frameLength)
+            let nch = Int(buf.format.channelCount)
+            if nch != self.chEnergy.count { self.chEnergy = [Double](repeating: 0, count: nch); self.inputChannels = nch }
+            // выбор канала
+            var sel = 0
+            if self.inputChannel > 0 {
+                sel = min(self.inputChannel, nch) - 1
+            } else if nch > 1 {
+                for c in 0..<nch {
+                    var e = 0.0
+                    let p = src[c]
+                    for i in stride(from: 0, to: n, by: 4) { e += Double(p[i] * p[i]) }
+                    self.chEnergy[c] = self.chEnergy[c] * 0.9 + e / Double(max(1, n / 4))
+                }
+                let best = self.chEnergy.indices.max(by: { self.chEnergy[$0] < self.chEnergy[$1] }) ?? 0
+                let cur = self.activeChannel - 1
+                // гистерезис: переключаемся, только если другой канал заметно громче
+                sel = (cur < nch && self.chEnergy[cur] * 2 >= self.chEnergy[best]) ? cur : best
+            }
+            self.activeChannel = sel + 1
+            let p = src[sel]
+            var peak: Float = 0
+            for i in 0..<n { peak = max(peak, abs(p[i])) }
+            // канал -> моно-буфер -> 8 кГц
+            if monoFmt == nil || monoFmt!.sampleRate != buf.format.sampleRate {
+                monoFmt = AVAudioFormat(standardFormatWithSampleRate: buf.format.sampleRate, channels: 1)
+                conv = monoFmt.flatMap { AVAudioConverter(from: $0, to: outFmt) }
+            }
+            guard let mf = monoFmt, let cv = conv,
+                  let mono = AVAudioPCMBuffer(pcmFormat: mf, frameCapacity: AVAudioFrameCount(n)),
+                  let md = mono.floatChannelData else { return }
+            mono.frameLength = AVAudioFrameCount(n)
+            md[0].update(from: p, count: n)
+            let cap = AVAudioFrameCount(Double(n) * Self.rxRate / mf.sampleRate) + 64
             guard let out = AVAudioPCMBuffer(pcmFormat: outFmt, frameCapacity: cap) else { return }
             var fed = false
             var err: NSError?
-            conv.convert(to: out, error: &err) { _, status in
+            cv.convert(to: out, error: &err) { _, status in
                 if fed { status.pointee = .noDataNow; return nil }
                 fed = true
                 status.pointee = .haveData
-                return buf
+                return mono
             }
             guard err == nil, let ch = out.floatChannelData, out.frameLength > 0 else { return }
             let x = Array(UnsafeBufferPointer(start: ch[0], count: Int(out.frameLength)))
-            var peak: Float = 0
-            for v in x { peak = max(peak, abs(v)) }
             self.onSamples?(x, peak)
         }
         do {

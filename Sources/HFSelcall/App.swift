@@ -86,7 +86,11 @@ struct ContentView: View {
                 .help("Обновить список устройств")
             Spacer()
             TxLamp(on: m.transmitting, keyed: m.pttKeyed)
-            LevelMeter(level: m.level).frame(width: 90, height: 10)
+            LevelMeter(level: m.level)
+            if m.receiving && m.inputChannels > 1 {
+                Text("кан. \(m.activeChannel)").font(.caption).foregroundStyle(.secondary)
+                    .help("Канал входа, по которому идёт приём (настройки → Приём → Канал входа)")
+            }
             Text(afcText)
                 .font(.system(.caption, design: .monospaced))
                 .foregroundStyle(.secondary)
@@ -237,18 +241,36 @@ struct LogView: View {
     }
 }
 
+/// Пиковый индикатор входа в дБFS (−60…0), как в HFP: зелёный, жёлтый с −12 дБ, красный с −3 дБ.
 struct LevelMeter: View {
-    var level: Float
+    var level: Float          // пик, линейно 0…1 (1 = полная шкала)
+    static let floor = -60.0
+    var db: Double { level > 0 ? max(Self.floor, 20 * log10(Double(level))) : Self.floor }
+    var fraction: CGFloat { CGFloat((db - Self.floor) / -Self.floor) }
+    var color: Color { db > -3 ? .red : (db > -12 ? .yellow : .green) }
+
     var body: some View {
-        GeometryReader { g in
-            ZStack(alignment: .leading) {
-                RoundedRectangle(cornerRadius: 3).fill(Color.secondary.opacity(0.2))
-                RoundedRectangle(cornerRadius: 3)
-                    .fill(level > 0.9 ? Color.red : (level > 0.6 ? Color.orange : Color.green))
-                    .frame(width: g.size.width * CGFloat(min(1, level)))
+        HStack(spacing: 6) {
+            GeometryReader { g in
+                ZStack(alignment: .leading) {
+                    RoundedRectangle(cornerRadius: 3).fill(Color.secondary.opacity(0.2))
+                    RoundedRectangle(cornerRadius: 3).fill(color)
+                        .frame(width: g.size.width * min(1, max(0, fraction)))
+                    // риски −40, −20, −12, −6, −3 дБ
+                    ForEach([-40.0, -20.0, -12.0, -6.0, -3.0], id: \.self) { m in
+                        Rectangle().fill(Color.primary.opacity(0.35))
+                            .frame(width: 1)
+                            .offset(x: g.size.width * CGFloat((m - Self.floor) / -Self.floor))
+                    }
+                }
             }
+            .frame(width: 110, height: 10)
+            Text(level > 0 && db > Self.floor ? String(format: "%5.1f дБ", db) : "  —  дБ")
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(db > -3 ? Color.red : Color.secondary)
+                .frame(width: 62, alignment: .trailing)
         }
-        .help(String(format: "Уровень входа: %.0f%%", level * 100))
+        .help("Пик входа в дБ относительно полной шкалы (0 дБFS). Красный — близко к перегрузке.")
     }
 }
 
@@ -370,6 +392,15 @@ struct SettingsView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Section("Приём") {
+                    Picker("Канал входа", selection: $m.inputChannel) {
+                        Text("Авто (где есть сигнал)").tag(0)
+                        Text("1 (левый)").tag(1)
+                        Text("2 (правый)").tag(2)
+                    }
+                    if m.receiving && m.inputChannels > 1 {
+                        Text("Сейчас используется канал \(m.activeChannel) из \(m.inputChannels).")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     Toggle("Автоподстройка частоты (АПЧ)", isOn: $m.autoAFC)
                     HStack {
                         Text("Центр без АПЧ")

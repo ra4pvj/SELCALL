@@ -62,6 +62,10 @@ final class AppModel: ObservableObject {
     @Published var autoAFC: Bool { didSet { defaults.set(autoAFC, forKey: "autoAFC"); applyCenter() } }
     @Published var fixedCenter: Double { didSet { defaults.set(fixedCenter, forKey: "fixedCenter"); applyCenter() } }
     @Published var showAll: Bool { didSet { defaults.set(showAll, forKey: "showAll") } }
+    /// Канал входа: 0 — авто, 1 — левый, 2 — правый …
+    @Published var inputChannel: Int { didSet { defaults.set(inputChannel, forKey: "inChannel"); audio.inputChannel = inputChannel } }
+    @Published var activeChannel = 1
+    @Published var inputChannels = 1
     @Published var inputDevice: AudioDeviceID { didSet { defaults.set(Int(inputDevice), forKey: "inDev"); if receiving { startRx() } } }
     @Published var outputDevice: AudioDeviceID { didSet { defaults.set(Int(outputDevice), forKey: "outDev"); txReady = false } }
 
@@ -125,9 +129,11 @@ final class AppModel: ObservableObject {
         autoAFC = defaults.object(forKey: "autoAFC") as? Bool ?? true
         fixedCenter = defaults.object(forKey: "fixedCenter") as? Double ?? Selcall.defaultCenter
         showAll = defaults.object(forKey: "showAll") as? Bool ?? true
+        inputChannel = defaults.integer(forKey: "inChannel")
         inputDevice = AudioDeviceID(defaults.integer(forKey: "inDev"))
         outputDevice = AudioDeviceID(defaults.integer(forKey: "outDev"))
         refreshDevices()
+        audio.inputChannel = inputChannel
         audio.onSamples = { [weak self] x, peak in self?.onSamples(x, peak) }
         reopenPTT()
         monitor.level = Float(monitorLevel)
@@ -273,7 +279,13 @@ final class AppModel: ObservableObject {
             self.receiver.append(y)
         }
         if monitorRX { monitor.feedRX(y) }
-        DispatchQueue.main.async { self.level = self.level * 0.6 + peak * 0.4 }
+        let ch = audio.activeChannel, nch = audio.inputChannels
+        DispatchQueue.main.async {
+            // пиковый индикатор: мгновенный подъём, плавный спад
+            self.level = max(peak, self.level * 0.8)
+            if self.activeChannel != ch { self.activeChannel = ch }
+            if self.inputChannels != nch { self.inputChannels = nch }
+        }
     }
 
     private func startTimer() {

@@ -70,7 +70,7 @@ LOG_FILE = os.path.join(APP_DIR, "journal.log")
 DEFAULTS = dict(
     my_id="1234", to_id="", in_dev="", out_dev="",
     dot_seconds=6.0, tx_level=0.5, translit=True,
-    afc=True, fixed_center=S.F_CENTER, show_all=True,
+    afc=True, fixed_center=S.F_CENTER, show_all=True, in_channel=0,
     ptt_method="none", ptt_port="", ptt_baud=9600, ptt_invert=False,
     ptt_icom_model="IC-7300", ptt_icom_addr="94", ptt_kenwood="TX;",
     ptt_delay=0.5, ptt_tail=0.3, mute_rx_on_tx=True,
@@ -81,6 +81,7 @@ DEFAULTS = dict(
 PTT_TITLES = {"none": "нет (VOX / внешний PTT)", "RTS": "RTS", "DTR": "DTR", "RTS+DTR": "RTS + DTR",
               "ICOM": "ICOM (CI-V)", "YAESU": "YAESU (TX1;/TX0;)", "YAESU-OLD": "YAESU-OLD (FT-817/857/897)",
               "KENWOOD": "KENWOOD (TX;/RX;)", "ELECRAFT": "ELECRAFT (TX;/RX;)"}
+IN_CHANNELS = ["Авто (где есть сигнал)", "1 (левый)", "2 (правый)"]
 RING_STYLES = [("codan", "Двухтональный (как CODAN)"), ("vertex", "Трель (как Vertex)"),
                ("beep", "Короткие гудки")]
 
@@ -376,6 +377,9 @@ class Core:
         self.receiving = False
         self.rx_start = time.time()
         self.level = 0.0
+        self.active_channel = 1
+        self.in_channels = 1
+        self.ch_energy = None
         self.mute_until = 0.0
         self.tx_player = Player()
         self.ring_players = []
@@ -422,11 +426,20 @@ class Core:
             raise RuntimeError("звуковая библиотека недоступна: %s" % SD_ERROR)
         self.stop_rx()
         dev = device_index(self.s["in_dev"], "in")
+        try:
+            maxin = int(sd.query_devices(dev if dev is not None else sd.default.device[0])["max_input_channels"])
+        except Exception:
+            maxin = 1
+        # открываем до 2 каналов и берём ОДИН (не среднее): у стерео-интерфейса трансивер обычно на одном
+        # входе, а сведение в моно с пустым каналом занижало сигнал вдвое
+        nch = 2 if maxin >= 2 else 1
         last = None
-        for fs in (RX_FS, 48000, 44100):
+        for fs, ch in ((RX_FS, nch), (48000, nch), (44100, nch), (RX_FS, 1), (48000, 1)):
             try:
-                st = sd.InputStream(samplerate=fs, device=dev, channels=1, dtype="float32",
+                st = sd.InputStream(samplerate=fs, device=dev, channels=ch, dtype="float32",
                                     blocksize=int(fs // 10), callback=self._on_audio)
+                self.in_channels = ch
+                self.ch_energy = np.zeros(ch)
                 self.down = Downsampler(fs)
                 st.start()
                 self.stream = st
@@ -455,9 +468,24 @@ class Core:
         self.level = 0.0
 
     def _on_audio(self, indata, frames, t, status):
-        x = indata[:, 0]
+        nch = indata.shape[1]
+        want = int(self.s.get("in_channel") or 0)
+        if want > 0:
+            sel = min(want, nch) - 1
+        elif nch > 1:
+            e = np.mean(indata[::4].astype(np.float64) ** 2, axis=0)
+            if self.ch_energy is None or len(self.ch_energy) != nch:
+                self.ch_energy = np.zeros(nch)
+            self.ch_energy = self.ch_energy * 0.9 + e
+            best = int(np.argmax(self.ch_energy))
+            cur = self.active_channel - 1
+            sel = cur if (cur < nch and self.ch_energy[cur] * 2 >= self.ch_energy[best]) else best
+        else:
+            sel = 0
+        self.active_channel = sel + 1
+        x = indata[:, sel]
         peak = float(np.max(np.abs(x))) if len(x) else 0.0
-        self.level = self.level * 0.6 + peak * 0.4
+        self.level = max(peak, self.level * 0.8)      # пиковый индикатор: быстрый подъём, плавный спад
         y = self.down.push(x)
         if time.time() < self.mute_until:
             y = np.zeros_like(y)
@@ -726,9 +754,16 @@ class App:
         self.btn_rx.pack(side="right")
         ttk.Button(top, text="Настройки", command=self.open_settings).pack(side="right", padx=4)
         ttk.Label(top, textvariable=self.v["afc"], width=14, font=self.font_mono).pack(side="right", padx=4)
-        self.meter = tk.Canvas(top, width=80, height=12, highlightthickness=1, highlightbackground="#999")
+        self.db_lbl = ttk.Label(top, text="  —  дБ", width=8, font=self.font_mono)
+        self.db_lbl.pack(side="right")
+        self.meter = tk.Canvas(top, width=110, height=12, highlightthickness=1, highlightbackground="#999")
         self.meter.pack(side="right", padx=4)
         self.meter_bar = self.meter.create_rectangle(0, 0, 0, 12, fill="#3a3", width=0)
+        for m in (-40, -20, -12, -6, -3):             # риски шкалы дБFS
+            x = 110 * (m + 60) / 60.0
+            self.meter.create_line(x, 0, x, 12, fill="#777")
+        self.ch_lbl = ttk.Label(top, text="", width=6)
+        self.ch_lbl.pack(side="right")
         lamp = tk.Canvas(top, width=40, height=14, highlightthickness=0)
         lamp.pack(side="right", padx=4)
         self.lamp = lamp.create_oval(2, 2, 12, 12, fill="#bbb", outline="")
@@ -985,9 +1020,20 @@ class App:
             self.v["afc"].set("f0 %.0f Гц" % float(self.core.s["fixed_center"]))
         elif not self.core.receiving:
             self.v["afc"].set("АПЧ —")
+        if self.core.receiving and self.core.in_channels > 1:
+            self.ch_lbl.configure(text="кан. %d" % self.core.active_channel)
+        else:
+            self.ch_lbl.configure(text="")
+        if not self.core.receiving:
+            self.core.level *= 0.8
         lv = min(1.0, self.core.level)
-        self.meter.coords(self.meter_bar, 0, 0, 80 * lv, 12)
-        self.meter.itemconfigure(self.meter_bar, fill="#c00" if lv > 0.9 else ("#d80" if lv > 0.6 else "#3a3"))
+        db = 20 * np.log10(lv) if lv > 1e-6 else -60.0
+        db = max(-60.0, db)
+        self.meter.coords(self.meter_bar, 0, 0, 110 * (db + 60) / 60.0, 12)
+        self.meter.itemconfigure(self.meter_bar, fill="#d00" if db > -3 else ("#db0" if db > -12 else "#3a3"))
+        self.meter.tag_raise("all")
+        self.meter.tag_lower(self.meter_bar)
+        self.db_lbl.configure(text=("%5.1f дБ" % db) if db > -60 else "  —  дБ")
         on = self.core.transmitting or self.core.ptt.keyed
         self.lamp_canvas.itemconfigure(self.lamp, fill="#e00" if on else "#bbb")
         self.root.after(100, self.poll)
@@ -1026,6 +1072,7 @@ class SettingsWindow:
             mute=tk.BooleanVar(value=s["mute_rx_on_tx"]),
             afc=tk.BooleanVar(value=s["afc"]), center=tk.DoubleVar(value=s["fixed_center"]),
             show_all=tk.BooleanVar(value=s["show_all"]),
+            in_channel=tk.StringVar(value=IN_CHANNELS[int(s.get("in_channel") or 0)]),
             ring=tk.BooleanVar(value=s["ring"]),
             ring_style=tk.StringVar(value=dict(RING_STYLES).get(s["ring_style"], RING_STYLES[0][1])),
             ring_vol=tk.DoubleVar(value=s["ring_volume"]), ring_sec=tk.DoubleVar(value=s["ring_seconds"]),
@@ -1085,6 +1132,9 @@ class SettingsWindow:
         ttk.Spinbox(f, from_=1000, to=2600, increment=5, textvariable=v["center"], width=8).grid(row=1, column=1, **pad)
         ttk.Checkbutton(f, text="Показывать вызовы не на мой ID", variable=v["show_all"]).grid(
             row=2, column=0, columnspan=2, **pad)
+        ttk.Label(f, text="Канал входа").grid(row=3, column=0, **pad)
+        ttk.Combobox(f, textvariable=v["in_channel"], values=IN_CHANNELS, state="readonly", width=24).grid(
+            row=3, column=1, **pad)
 
         f = ttk.LabelFrame(w, text="Самоконтроль (динамики, наушники — можно несколько)", padding=6)
         f.grid(row=0, column=1, rowspan=2, sticky="nsew", padx=10, pady=(10, 4))
@@ -1167,6 +1217,7 @@ class SettingsWindow:
         s["afc"] = bool(v["afc"].get())
         s["fixed_center"] = self._num(v["center"], 1000, 2600, S.F_CENTER)
         s["show_all"] = bool(v["show_all"].get())
+        s["in_channel"] = IN_CHANNELS.index(v["in_channel"].get()) if v["in_channel"].get() in IN_CHANNELS else 0
         s["ring"] = bool(v["ring"].get())
         s["ring_style"] = next((k for k, t in RING_STYLES if t == v["ring_style"].get()), "codan")
         s["ring_volume"] = self._num(v["ring_vol"], 0.05, 1.0, 0.5)
@@ -1239,6 +1290,20 @@ def selftest(out_path):
         good = len(r) == 1 and r[0]["from"] == "1111"
         log("downsampler %d -> 8000: %s" % (fs_in, "OK" if good else "FAIL"))
         ok = ok and good
+    c = Core.__new__(Core)
+    c.s = dict(DEFAULTS)
+    c.level, c.active_channel, c.ch_energy, c.mute_until = 0.0, 1, None, 0.0
+    c.down = Downsampler(48000)
+    c.audio_q = queue.Queue()
+    c.monitor = Monitor()
+    stereo = np.zeros((4800, 2), np.float32)
+    stereo[:, 1] = 0.9 * np.sin(np.arange(4800) * 0.2)          # сигнал только во втором канале
+    for _ in range(5):
+        c._on_audio(stereo, 4800, None, None)
+    good = c.active_channel == 2 and c.level > 0.85
+    log("input channel auto-select + peak level: %s (channel %d, level %.2f)" % (
+        "OK" if good else "FAIL", c.active_channel, c.level))
+    ok = ok and good
     pat = ring_pattern("codan", 48000, 0.5)
     log("ring pattern: %s" % ("OK" if len(pat) > 0 and np.abs(pat).max() <= 0.51 else "FAIL"))
     cat = [PTT.command_bytes("ICOM", True, 0x94), PTT.command_bytes("YAESU", True),
