@@ -4,6 +4,7 @@
 import AVFoundation
 import CoreAudio
 import Foundation
+import ObjCSafe
 
 enum RingStyle: String, CaseIterable, Identifiable {
     case codan, vertex, beep
@@ -58,25 +59,32 @@ final class Ringer {
         stop()
         for dev in (devices.isEmpty ? [AudioDeviceID(0)] : devices) {
             let e = AVAudioEngine()
-            AudioDevices.select(dev, on: e.outputNode)
             let p = AVAudioPlayerNode()
-            e.attach(p)
-            var fs = e.outputNode.outputFormat(forBus: 0).sampleRate
-            if fs <= 0 { fs = 48000 }
-            guard let fmt = AVAudioFormat(standardFormatWithSampleRate: fs, channels: 1) else { continue }
-            e.connect(p, to: e.mainMixerNode, format: fmt)
+            var fs = 48000.0
+            var fmt: AVAudioFormat?
+            let err = ObjCSafe.run {
+                AudioDevices.select(dev, on: e.outputNode)
+                e.attach(p)
+                let r = e.outputNode.outputFormat(forBus: 0).sampleRate
+                if r > 0 { fs = r }
+                fmt = AVAudioFormat(standardFormatWithSampleRate: fs, channels: 1)
+                if let f = fmt { e.connect(p, to: e.mainMixerNode, format: f) }
+            }
+            guard err == nil, let f = fmt else { continue }
             let x = Ringer.pattern(style, fs: fs, volume: volume)
-            guard let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: AVAudioFrameCount(x.count)),
+            guard let buf = AVAudioPCMBuffer(pcmFormat: f, frameCapacity: AVAudioFrameCount(x.count)),
                   let ch = buf.floatChannelData else { continue }
             buf.frameLength = AVAudioFrameCount(x.count)
             x.withUnsafeBufferPointer { ch[0].update(from: $0.baseAddress!, count: x.count) }
-            do {
+            var ok = false
+            _ = ObjCSafe.run {
                 e.prepare()
-                try e.start()
-            } catch { continue }
-            p.scheduleBuffer(buf, at: nil, options: [.loops], completionHandler: nil)
-            p.play()
-            engines.append(e)
+                guard (try? e.start()) != nil else { return }
+                p.scheduleBuffer(buf, at: nil, options: [.loops], completionHandler: nil)
+                p.play()
+                ok = true
+            }
+            if ok { engines.append(e) }
         }
         let w = DispatchWorkItem { [weak self] in self?.stop() }
         stopWork = w
@@ -86,7 +94,7 @@ final class Ringer {
     func stop() {
         stopWork?.cancel()
         stopWork = nil
-        for e in engines { e.stop() }
+        for e in engines { _ = ObjCSafe.run { e.stop() } }
         engines.removeAll()
     }
 }
@@ -124,26 +132,30 @@ final class Monitor {
         lock.lock(); defer { lock.unlock() }
         errors = []
         for (id, o) in outs where !devices.contains(id) {
-            o.engine.stop()
+            _ = ObjCSafe.run { o.engine.stop() }
             outs[id] = nil
         }
         for id in devices where outs[id] == nil {
             let o = Out()
-            AudioDevices.select(id, on: o.engine.outputNode)
-            o.engine.attach(o.rx)
-            o.engine.attach(o.tx)
-            o.engine.connect(o.rx, to: o.engine.mainMixerNode, format: fmt)
-            o.engine.connect(o.tx, to: o.engine.mainMixerNode, format: fmt)
-            o.rx.volume = level
-            o.tx.volume = level
-            do {
+            let f = fmt
+            var startError: Error?
+            let ex = ObjCSafe.run {
+                AudioDevices.select(id, on: o.engine.outputNode)
+                o.engine.attach(o.rx)
+                o.engine.attach(o.tx)
+                o.engine.connect(o.rx, to: o.engine.mainMixerNode, format: f)
+                o.engine.connect(o.tx, to: o.engine.mainMixerNode, format: f)
+                o.rx.volume = level
+                o.tx.volume = level
                 o.engine.prepare()
-                try o.engine.start()
+                do { try o.engine.start() } catch { startError = error; return }
                 o.rx.play()
                 o.tx.play()
+            }
+            if let r = ex ?? startError?.localizedDescription {
+                errors.append("\(names[id] ?? "устройство \(id)"): \(r)")
+            } else {
                 outs[id] = o
-            } catch {
-                errors.append("\(names[id] ?? "устройство \(id)"): \(error.localizedDescription)")
             }
         }
     }
@@ -166,10 +178,13 @@ final class Monitor {
             if !drop { o.queued += 1 }
             o.lock.unlock()
             if drop { continue }
-            o.rx.scheduleBuffer(b) { [weak o] in
-                guard let o = o else { return }
-                o.lock.lock(); o.queued -= 1; o.lock.unlock()
+            let r = ObjCSafe.run {
+                o.rx.scheduleBuffer(b) { [weak o] in
+                    guard let o = o else { return }
+                    o.lock.lock(); o.queued -= 1; o.lock.unlock()
+                }
             }
+            if r != nil { o.lock.lock(); o.queued -= 1; o.lock.unlock() }
         }
     }
 
@@ -177,20 +192,22 @@ final class Monitor {
     func feedTX(_ x8: [Float]) {
         lock.lock(); let list = Array(outs.values); lock.unlock()
         guard !list.isEmpty, let b = buffer(x8) else { return }
-        for o in list { o.tx.scheduleBuffer(b, completionHandler: nil) }
+        for o in list { _ = ObjCSafe.run { o.tx.scheduleBuffer(b, completionHandler: nil) } }
     }
 
     func stopTX() {
         lock.lock(); let list = Array(outs.values); lock.unlock()
         for o in list {
-            o.tx.stop()
-            o.tx.play()
+            _ = ObjCSafe.run {
+                o.tx.stop()
+                o.tx.play()
+            }
         }
     }
 
     func close() {
         lock.lock(); defer { lock.unlock() }
-        for o in outs.values { o.engine.stop() }
+        for o in outs.values { _ = ObjCSafe.run { o.engine.stop() } }
         outs.removeAll()
     }
 }

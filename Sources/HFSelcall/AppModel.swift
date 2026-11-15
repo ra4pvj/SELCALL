@@ -237,7 +237,7 @@ final class AppModel: ObservableObject {
             guard let self = self else { return }
             guard ok else { self.addError(AudioIOError.noPermission.localizedDescription); return }
             do {
-                try self.audio.startRx(device: self.inputDevice)
+                if let warn = try self.audio.startRx(device: self.inputDevice) { self.addError(warn) }
                 self.dsp.sync {
                     self.receiver.reset()
                 }

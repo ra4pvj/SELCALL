@@ -11,7 +11,8 @@ let package = Package(
     ],
     targets: [
         .target(name: "SelcallCore", path: "Sources/SelcallCore"),
-        .executableTarget(name: "HFSelcall", dependencies: ["SelcallCore"], path: "Sources/HFSelcall"),
+        .target(name: "ObjCSafe", path: "Sources/ObjCSafe"),
+        .executableTarget(name: "HFSelcall", dependencies: ["SelcallCore", "ObjCSafe"], path: "Sources/HFSelcall"),
         .executableTarget(name: "selcall-cli", dependencies: ["SelcallCore"], path: "Sources/selcall-cli"),
     ]
 )

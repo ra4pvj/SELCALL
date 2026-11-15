@@ -5,6 +5,17 @@
 import AVFoundation
 import CoreAudio
 import Foundation
+import ObjCSafe
+
+/// Выполнить вызов AVAudioEngine, превращая NSException в Swift-ошибку.
+func objcSafe(_ what: String, _ body: () throws -> Void) throws {
+    var swiftError: Error?
+    let reason = ObjCSafe.run {
+        do { try body() } catch { swiftError = error }
+    }
+    if let r = reason { throw AudioIOError.engine("\(what): \(r)") }
+    if let e = swiftError { throw e }
+}
 
 struct AudioDevice: Identifiable, Hashable {
     let id: AudioDeviceID
@@ -67,9 +78,10 @@ enum AudioDevices {
 }
 
 enum AudioIOError: LocalizedError {
-    case noInput, converter, noPermission
+    case noInput, converter, noPermission, engine(String)
     var errorDescription: String? {
         switch self {
+        case .engine(let s): return s
         case .noInput: return "входное устройство недоступно"
         case .converter: return "не удалось создать преобразователь формата"
         case .noPermission: return "нет доступа к микрофону (Системные настройки → Конфиденциальность → Микрофон)"
@@ -97,17 +109,36 @@ final class AudioIO {
         }
     }
 
-    func startRx(device: AudioDeviceID) throws {
+    /// Запуск приёма. Возвращает предупреждение, если пришлось перейти на системный вход.
+    @discardableResult
+    func startRx(device: AudioDeviceID) throws -> String? {
         stopRx()
+        do {
+            try startRxOn(device: device)
+            return nil
+        } catch {
+            // выбранное устройство не открылось — пробуем системный вход, чтобы не остаться без приёма
+            guard device != 0 else { throw error }
+            stopRx()
+            try startRxOn(device: 0)
+            return "Выбранный вход не открылся (\(error.localizedDescription)); включён системный вход по умолчанию"
+        }
+    }
+
+    private func startRxOn(device: AudioDeviceID) throws {
         let engine = AVAudioEngine()
-        let input = engine.inputNode
+        var input: AVAudioInputNode!
+        try objcSafe("вход") { input = engine.inputNode }
         AudioDevices.select(device, on: input)
-        let inFmt = input.outputFormat(forBus: 0)
-        guard inFmt.sampleRate > 0, inFmt.channelCount > 0 else { throw AudioIOError.noInput }
-        guard let outFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: Self.rxRate,
+        // формат берём с самого устройства (inputFormat шины 0); outputFormat после смены
+        // устройства может остаться старым — из-за этого installTap падал с исключением
+        let hw = input.inputFormat(forBus: 0)
+        guard hw.sampleRate > 0, hw.channelCount > 0 else { throw AudioIOError.noInput }
+        guard let inFmt = AVAudioFormat(standardFormatWithSampleRate: hw.sampleRate, channels: hw.channelCount),
+              let outFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: Self.rxRate,
                                          channels: 1, interleaved: false),
               let conv = AVAudioConverter(from: inFmt, to: outFmt) else { throw AudioIOError.converter }
-        input.installTap(onBus: 0, bufferSize: 4096, format: inFmt) { [weak self] buf, _ in
+        let tap: AVAudioNodeTapBlock = { [weak self] buf, _ in
             guard let self = self else { return }
             let cap = AVAudioFrameCount(Double(buf.frameLength) * Self.rxRate / inFmt.sampleRate) + 64
             guard let out = AVAudioPCMBuffer(pcmFormat: outFmt, frameCapacity: cap) else { return }
@@ -125,15 +156,30 @@ final class AudioIO {
             for v in x { peak = max(peak, abs(v)) }
             self.onSamples?(x, peak)
         }
-        engine.prepare()
-        try engine.start()
+        do {
+            try objcSafe("подключение ко входу") {
+                input.installTap(onBus: 0, bufferSize: 4096, format: inFmt, block: tap)
+            }
+        } catch {
+            // запасной вариант: формат по умолчанию самого узла
+            _ = ObjCSafe.run { input.removeTap(onBus: 0) }
+            try objcSafe("подключение ко входу") {
+                input.installTap(onBus: 0, bufferSize: 4096, format: nil, block: tap)
+            }
+        }
+        try objcSafe("запуск приёма") {
+            engine.prepare()
+            try engine.start()
+        }
         rxEngine = engine
     }
 
     func stopRx() {
         if let e = rxEngine {
-            e.inputNode.removeTap(onBus: 0)
-            e.stop()
+            _ = ObjCSafe.run {
+                e.inputNode.removeTap(onBus: 0)
+                e.stop()
+            }
         }
         rxEngine = nil
     }
@@ -153,9 +199,11 @@ final class AudioIO {
         guard let fmt = AVAudioFormat(standardFormatWithSampleRate: txRate, channels: 1) else {
             throw AudioIOError.converter
         }
-        engine.connect(p, to: engine.mainMixerNode, format: fmt)
-        engine.prepare()
-        try engine.start()
+        try objcSafe("выход") {
+            engine.connect(p, to: engine.mainMixerNode, format: fmt)
+            engine.prepare()
+            try engine.start()
+        }
         txEngine = engine
         player = p
         return txRate
@@ -173,16 +221,22 @@ final class AudioIO {
         samples.withUnsafeBufferPointer { src in
             ch[0].update(from: src.baseAddress!, count: samples.count)
         }
-        if !e.isRunning { try? e.start() }
-        p.scheduleBuffer(buf, at: nil, options: [], completionCallbackType: .dataPlayedBack) { _ in
-            DispatchQueue.main.async { done() }
+        let r = ObjCSafe.run {
+            if !e.isRunning { try? e.start() }
+            p.scheduleBuffer(buf, at: nil, options: [], completionCallbackType: .dataPlayedBack) { _ in
+                DispatchQueue.main.async { done() }
+            }
+            p.play()
         }
-        p.play()
+        if r != nil { done() }
     }
 
     func stopTx() {
-        player?.stop()
-        txEngine?.stop()
+        let p = player, e = txEngine
+        _ = ObjCSafe.run {
+            p?.stop()
+            e?.stop()
+        }
         player = nil
         txEngine = nil
     }
