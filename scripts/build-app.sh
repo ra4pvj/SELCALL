@@ -7,7 +7,7 @@ cd "$(dirname "$0")/.."
 
 APP_NAME="HF Selcall"
 BUNDLE_ID="com.ra4pvj.hfselcall"
-VERSION="$(git describe --tags --match "v*" --always 2>/dev/null || echo 0.1)"
+VERSION="$(tr -d ' \r\n' < VERSION 2>/dev/null || echo 0.1)"
 
 if [[ "${UNIVERSAL:-0}" == "1" ]]; then
     ARCH_FLAGS=(--arch arm64 --arch x86_64)

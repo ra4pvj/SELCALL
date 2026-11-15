@@ -17,7 +17,7 @@
 - `HFSelcall-macOS.zip` — macOS 13+, Apple Silicon и Intel;
 - `HFSelcall-Windows-x64.zip` / `HFSelcall-Windows-x86.zip` — Windows 7 SP1 … 11, папка с `HFSelcall.exe`, без установки (см. `windows/README_WINDOWS.txt`).
 
-Сборки делает GitHub Actions (`.github/workflows/build.yml`). Windows‑версия собирается под Windows 7 так же, как HFP: Python 3.8.10, numpy 1.24.4 (работает и на процессорах без SSE4.2), sounddevice 0.4.6, PyInstaller 5.13.2 в режиме папки (onedir — без распаковки в %TEMP%). UCRT лежит рядом с exe. Каждый раз сборка проверяется самотестом готового exe и сканированием всех DLL/PYD и загрузчика на функции Windows 8+ (`windows/check_win7.py`). Чтобы выпустить релиз: `git tag v0.3.0 && git push origin v0.3.0`.
+Сборки делает GitHub Actions (`.github/workflows/build.yml`). Windows‑версия собирается под Windows 7 так же, как HFP: Python 3.8.10, numpy 1.24.4 (работает и на процессорах без SSE4.2), sounddevice 0.4.6, PyInstaller 5.13.2 в режиме папки (onedir — без распаковки в %TEMP%). UCRT лежит рядом с exe. Каждый раз сборка проверяется самотестом готового exe и сканированием всех DLL/PYD и загрузчика на функции Windows 8+ (`windows/check_win7.py`). Чтобы выпустить релиз, поменяйте номер в файле `VERSION` (например, `0.3.1`) и отправьте в `main` — workflow сам создаст тег `v0.3.1` и релиз; можно и вручную тегом `vX.Y.Z`.
 
 ## Сборка
 

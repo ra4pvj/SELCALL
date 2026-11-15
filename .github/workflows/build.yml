@@ -1,7 +1,8 @@
 name: Build macOS + Windows and release
 
-# main  -> пересобирается пре-релиз "latest"
-# тег v* -> постоянный релиз с этим номером (git tag v0.3.0 && git push origin v0.3.0)
+# main  -> пересобирается пре-релиз "latest"; если в файле VERSION номер, для которого ещё нет
+#          релиза, — дополнительно создаётся тег vX.Y.Z и постоянный релиз (поднять версию = поменять VERSION)
+# тег v* -> постоянный релиз с этим номером
 on:
   push:
     branches: [main]
@@ -81,7 +82,7 @@ jobs:
 
       - name: Version
         run: |
-          $v = git describe --tags --match "v*" --always
+          $v = "v" + (Get-Content VERSION -Raw).Trim() + "+" + (git rev-parse --short HEAD)
           "VERSION = '$v'" | Out-File -Encoding ascii windows/_version.py
           "Version: $v"
 
@@ -142,6 +143,8 @@ jobs:
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v5
+
       - uses: actions/download-artifact@v5
         with:
           path: dist
@@ -167,4 +170,9 @@ jobs:
             gh release delete latest -R "$REPO" --yes --cleanup-tag || true
             gh release create latest dist/* -R "$REPO" --target "$GITHUB_SHA" --prerelease \
               --title "HF Selcall (последняя сборка ${GITHUB_SHA::7})" --notes "$NOTES"
+            TAG="v$(tr -d ' \r\n' < VERSION)"
+            if ! gh release view "$TAG" -R "$REPO" >/dev/null 2>&1; then
+              gh release create "$TAG" dist/* -R "$REPO" --target "$GITHUB_SHA" --latest \
+                --title "HF Selcall $TAG" --notes "$NOTES"
+            fi
           fi
