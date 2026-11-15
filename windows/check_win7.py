@@ -37,7 +37,11 @@ def main():
     bad = []
     crt = set()
     n = 0
-    for f in files(sys.argv[1:]):
+    all_files = list(files(sys.argv[1:]))
+    # библиотеки, лежащие в проверяемых папках (например, UCRT-переходники api-ms-win-core-*
+    # из официального дистрибутива UCRT для Windows 7) — их импорт разрешается локально
+    bundled = {os.path.basename(f).lower() for f in all_files}
+    for f in all_files:
         try:
             pe = pefile.PE(f, fast_load=True)
             pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"],
@@ -51,7 +55,7 @@ def main():
             dll = e.dll.decode(errors="replace").lower()
             if dll.startswith("api-ms-win-crt") or dll == "ucrtbase.dll":
                 crt.add(os.path.basename(f))
-            if any(dll.startswith(w) for w in WIN8_DLLS):
+            if any(dll.startswith(w) for w in WIN8_DLLS) and dll not in bundled:
                 bad.append("%s: импорт %s" % (f, dll))
             for imp in e.imports:
                 name = imp.name.decode(errors="replace") if imp.name else ""
