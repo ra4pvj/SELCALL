@@ -9,7 +9,7 @@ import SelcallCore
 func usage() -> Never {
     print("""
     usage:
-      selcall-cli encode --to ID --from ID [--msg TEXT] [--fs 48000] [--dot 2.0] [--center 1700] [--eos 117|122|127] -o out.wav
+      selcall-cli encode --to ID --from ID [--msg TEXT] [--fs 48000] [--dot 6.0] [--center 1700] [--eos 117|122|127] -o out.wav
       selcall-cli decode file.wav [--center HZ]
       selcall-cli selftest
     """)
@@ -47,7 +47,7 @@ switch cmd {
 case "encode":
     guard let to = opt("--to"), let from = opt("--from"), let out = opt("-o") ?? opt("--out") else { usage() }
     let fs = Double(opt("--fs") ?? "48000") ?? 48000
-    let dot = Double(opt("--dot") ?? "2") ?? 2
+    let dot = Double(opt("--dot") ?? "6") ?? 6
     let center = Double(opt("--center") ?? "1700") ?? 1700
     let eos = Int(opt("--eos") ?? "117") ?? 117
     let msg = opt("--msg").map { Translit.latin($0) }
@@ -119,6 +119,28 @@ case "selftest":
         print("wav 48k roundtrip:", wavOK ? "OK" : "FAIL")
         ok = ok && wavOK
     } catch { print("wav error: \(error)"); ok = false }
+
+    // 4) кодер даёт тот же поток символов, что и реальная запись CODAN
+    let reference = [125, 109, 125, 108, 125, 107, 125, 106, 125, 105, 125, 104, 120, 120, 12, 120, 34, 120,
+                     100, 12, 11, 34, 11, 100, 117, 11, 117, 11, 117, 117]
+    let frameOK = Selcall.buildCall(to: "1234", from: "1111") == reference
+    print("frame matches CODAN recording:", frameOK ? "OK" : "FAIL")
+    ok = ok && frameOK
+
+    // 5) реальная запись (если запускаем из корня репозитория)
+    let rec = URL(fileURLWithPath: "testdata/SELCALL_from_1111_to_1234.wav")
+    if FileManager.default.fileExists(atPath: rec.path) {
+        do {
+            let (z, zfs) = try WAV.read(rec)
+            let r = decodeFile(z, zfs, center: nil)
+            r.forEach { print("  ", $0.summary) }
+            let recOK = r.count == 1 && r[0].from == "1111" && r[0].to == "1234" && r[0].eccOK
+            print("real recording 1111 -> 1234:", recOK ? "OK" : "FAIL")
+            ok = ok && recOK
+        } catch { print("recording error: \(error)"); ok = false }
+    } else {
+        print("real recording: пропущено (нет testdata/)")
+    }
 
     print("SELFTEST", ok ? "OK" : "FAIL")
     exit(ok ? 0 : 1)

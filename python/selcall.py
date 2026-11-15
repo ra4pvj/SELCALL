@@ -3,10 +3,13 @@
 HF Selcall (CCIR 493-4, CODAN/Barrett-compatible) — кодер и декодер.
 Поддерживаются: Selcall (индивидуальный вызов) и Message call (текст).
 
-Физика:   FSK 100 бод, сдвиг 170 Гц, центр 1700 Гц (1615 = "1"/B, 1785 = "0"/Y)
+Физика:   FSK 100 бод, сдвиг 170 Гц, центр 1785 Гц (1870 = "1", 1700 = "0" в USB)
 Символ:   10 бит = 7 инф. (LSB первым) + 3 проверочных (число нулей, MSB первым)
-Кадр:     точки -> фазировка (DX=125, RX=111..104) -> F F A.. C S.. [MSG..] EOS ECC
-          каждый символ передаётся дважды (DX и RX, RX отстаёт на 2 пары слотов)
+Кадр (по реальной записи, SELCALL_from_1111_to_1234.wav):
+          DX: 125 x6 | F     A.. C S.. [MSG..] EOS EOS EOS
+          RX: 109..104 | F F F A.. C S.. [MSG..] EOS
+          RX-копия отстаёт от DX на 5 символов. Символа ECC в записи нет.
+Декодер понимает и этот кадр, и вариант M.493 (8 RX фазировки, F F, ECC).
 
 Использование:
   python selcall.py encode --to 1234 --from 5678 -o call.wav
@@ -23,7 +26,7 @@ import numpy as np
 
 # ---------------------------------------------------------------- константы
 BAUD = 100.0
-F_CENTER = 1700.0
+F_CENTER = 1785.0
 SHIFT = 170.0
 
 FMT_SELCALL = 120          # индивидуальный вызов
@@ -35,7 +38,8 @@ EOS_SET = (EOS_ACK_RQ, EOS_ACK_BQ, EOS_EOS)
 EOS_NAMES = {EOS_ACK_RQ: "ACK-RQ", EOS_ACK_BQ: "ACK-BQ", EOS_EOS: "EOS"}
 
 PHASE_DX = 125
-PHASE_RX = list(range(111, 103, -1))   # 111,110,...,104 (RX7..RX0)
+PHASE_RX = list(range(109, 103, -1))   # 109..104 (RX5..RX0), как в записи CODAN
+RX_PHASING = set(range(104, 112))
 MAX_MSG = 64
 
 
@@ -88,23 +92,22 @@ def syms_to_msg(syms):
 # ---------------------------------------------------------------- кодер
 def build_call(to_id, from_id, message=None, fmt=FMT_SELCALL,
                category=CAT_ROUTINE, eos=EOS_ACK_RQ):
-    """Возвращает поток символов в порядке передачи (DX, RX, DX, RX ...)."""
-    to_s, fr_s = str(to_id), str(from_id)
+    """Поток символов в порядке передачи (DX, RX, DX, RX ...), кадр как в записи CODAN."""
+    to_s = "".join(ch for ch in str(to_id) if ch.isdigit())
+    fr_s = "".join(ch for ch in str(from_id) if ch.isdigit())
     n = max(len(to_s), len(fr_s))
     a, s = id_to_syms(to_s.zfill(n)), id_to_syms(fr_s.zfill(n))
     m = msg_to_syms(message) if message else []
-    info = [fmt] + a + [category] + s + m + [eos]
-    ecc = reduce(lambda x, y: x ^ y, info)
-    body = [fmt] + info + [ecc]                 # format specifier передаётся дважды
-    dx = [PHASE_DX] * 6 + body + [eos, eos]     # EOS трижды в DX
-    rx = PHASE_RX + body
+    rest = a + [category] + s + m
+    dx = [PHASE_DX] * 6 + [fmt] + rest + [eos] * 3
+    rx = PHASE_RX + [fmt] * 3 + rest + [eos]
     stream = []
     for d, r in zip(dx, rx):
         stream += [d, r]
     return stream
 
 
-def modulate(stream, fs=48000, dot_seconds=2.0, center=F_CENTER, amp=0.5):
+def modulate(stream, fs=48000, dot_seconds=6.0, center=F_CENTER, amp=0.5):
     ndots = int(dot_seconds * BAUD) // 2 * 2
     bits = [1, 0] * (ndots // 2)
     for v in stream:
@@ -113,7 +116,7 @@ def modulate(stream, fs=48000, dot_seconds=2.0, center=F_CENTER, amp=0.5):
     nsamp = int(round(len(bits) * fs / BAUD))
     t = np.arange(nsamp)
     bit_idx = np.minimum((t * BAUD / fs).astype(int), len(bits) - 1)
-    f = np.where(bits[bit_idx] == 1, center - SHIFT / 2, center + SHIFT / 2)
+    f = np.where(bits[bit_idx] == 1, center + SHIFT / 2, center - SHIFT / 2)
     phase = 2 * np.pi * np.cumsum(f) / fs            # непрерывная фаза
     y = amp * np.sin(phase)
     ramp = int(0.005 * fs)                           # 5 мс плавные края
@@ -171,15 +174,13 @@ def tone_diff(x, fs, center):
         y = x * np.exp(-2j * np.pi * f * n / fs)
         return np.abs(np.convolve(y, k, mode="same"))
 
-    return mag(center - SHIFT / 2) - mag(center + SHIFT / 2)   # >0 => бит "1"
-
-
-# phasing template: (слот в потоке, символ)
-_TEMPLATE = [(2 * i, PHASE_DX) for i in range(6)] + \
-            [(2 * i + 1, PHASE_RX[i]) for i in range(8)]
+    return mag(center + SHIFT / 2) - mag(center - SHIFT / 2)   # >0 => бит "1" (верхний тон)
 
 
 def _find_calls_in_bits(bits):
+    """Ищем фазировку. Якорь q — позиция (в битах) символа RX0 = 104.
+    Счёт: RX-фазировка 104+i в q-20i и DX 125 в q-10-20m. Подходит и для
+    короткой (6 RX, CODAN), и для полной (8 RX, M.493) фазировки."""
     N = len(bits)
     if N < 400:
         return []
@@ -188,84 +189,106 @@ def _find_calls_in_bits(bits):
     for i in range(10):
         w += bits[i:i + M].astype(np.int32) << i
     sym = SYM_LUT[w]
-    span = 10 * 16
-    if M <= span:
-        return []
-    P = M - span
-    score = np.zeros(P, dtype=np.int16)
-    for slot, val in _TEMPLATE:
-        score += (sym[slot * 10: slot * 10 + P] == val)
-    cand = np.where(score >= 8)[0]
-    # подавление немаксимумов
+    PAD = 200
+    sp = np.concatenate([np.full(PAD, -1, np.int16), sym, np.full(PAD, -1, np.int16)])
+    q = np.arange(PAD, PAD + M)
+    score = np.zeros(M, dtype=np.int16)
+    for i in range(8):
+        score += sp[q - 20 * i] == 104 + i
+        score += sp[q - 10 - 20 * i] == PHASE_DX
+    cand = np.where(score >= 7)[0]
     order = cand[np.argsort(-score[cand], kind="stable")]
-    taken, starts = [], []
+    taken, calls = [], []
     for p in order:
-        if all(abs(p - q) > 200 for q in taken):
-            taken.append(p)
-            starts.append((int(p), int(score[p])))
-    calls = []
-    for p, sc in starts:
-        res = _extract(sym, p)
+        if any(abs(p - t) <= 200 for t in taken):
+            continue
+        taken.append(p)
+        res = _extract(sym, int(p))
         if res:
-            res["bitpos"] = p
-            res["phasing_score"] = sc
+            res["bitpos"] = max(0, int(p) - 230)          # примерно начало фазировки
+            res["phasing_score"] = int(score[p])
             calls.append(res)
     return calls
 
 
-def _extract(sym, p, max_body=90):
+def _extract(sym, q, max_len=90):
+    """Логическая последовательность L[k]: DX в q+10+20k и его RX-копия в q+60+20k."""
     M = len(sym)
 
-    def slot(i):
-        j = p + 10 * i
-        if j >= M:
+    def at(j):
+        if j < 0 or j >= M:
             return None
         v = int(sym[j])
         return v if v >= 0 else None
 
-    body, conf = [], []
-    for k in range(max_body):
-        d = slot(2 * (6 + k))          # DX копия
-        r = slot(2 * (8 + k) + 1)      # RX копия
-        if d is None:
-            body.append(r); conf.append(False)
+    L = []
+    for k in range(-2, max_len):
+        d, r = at(q + 10 + 20 * k), at(q + 60 + 20 * k)
+        if d == PHASE_DX:
+            d = None
+        if r in RX_PHASING:
+            r = None
+        if d is None and r is None:
+            L.append((None, False, 0))
+        elif d is None or r is None:
+            L.append((d if r is None else r, False, 1))
         else:
-            body.append(d); conf.append(r is not None and r != d)
-    return _parse(body, conf)
+            L.append((d, d != r, 2 if d == r else 1))
+        if d is None and r is None and k > 6 and all(v is None for v, _, _ in L[-3:]):
+            break
+    return _parse(L)
 
 
-def _parse(body, conf):
-    fmt = body[0] if body[0] is not None else body[1]
-    if fmt is None:
+def _parse(L):
+    vals = [v for v, _, _ in L]
+    i = 0
+    while i < len(vals) and i < 3 and vals[i] is None:
+        i += 1
+    if i >= len(vals) or vals[i] is None or vals[i] < 100 or vals[i] in EOS_SET:
         return None
-    i = 2
+    fmt = vals[i]
+    i += 1
+    while i < len(vals) and vals[i] == fmt:
+        i += 1
     addr = []
-    while i < len(body) and body[i] is not None and body[i] < 100 and len(addr) < 5:
-        addr.append(body[i]); i += 1
-    if not addr or i >= len(body) or body[i] is None:
+    while i < len(vals) and vals[i] is not None and vals[i] < 100 and len(addr) < 5:
+        addr.append(vals[i]); i += 1
+    if not addr or i >= len(vals) or vals[i] is None or vals[i] < 100:
         return None
-    category = body[i]; i += 1
-    selfid = body[i:i + len(addr)]
+    category = vals[i]; i += 1
+    selfid = vals[i:i + len(addr)]
     if len(selfid) < len(addr) or any(v is None or v >= 100 for v in selfid):
         return None
     i += len(addr)
     head = [fmt] + addr + [category] + selfid
     best = None
-    for j in range(i, min(len(body) - 1, i + MAX_MSG + 1)):
-        if body[j] in EOS_SET:
-            msg = body[i:j]
-            if any(v is None for v in msg):
-                ecc_ok = False
+    for j in range(i, min(len(vals), i + MAX_MSG + 1)):
+        if vals[j] not in EOS_SET:
+            continue
+        msg = vals[i:j]
+        nxt = vals[j + 1] if j + 1 < len(vals) else None
+        if any(v is None for v in msg):
+            status = "BAD"
+        else:
+            ecc = reduce(lambda x, y: x ^ y, head + msg + [vals[j]])
+            if nxt == ecc:
+                status = "ok"
+            elif nxt is None or nxt == vals[j]:
+                status = "нет"
             else:
-                ecc_ok = reduce(lambda x, y: x ^ y, head + msg + [body[j]]) == body[j + 1]
-            if ecc_ok:
-                best = (j, True); break
-            if best is None:
-                best = (j, False)
+                status = "BAD"
+        if status != "BAD":
+            best = (j, status); break
+        if best is None:
+            best = (j, status)
     if best is None:
         return None
-    j, ecc_ok = best
-    msg = body[i:j]
+    j, status = best
+    msg = vals[i:j]
+    seg = L[:j + 1]
+    conflicts = sum(1 for _, c, _ in seg if c)
+    single = sum(1 for v, c, n in seg if v is not None and n == 1)
+    valid = status == "ok" or (status == "нет" and conflicts == 0 and None not in head + msg)
     return {
         "type": "message" if msg else "selcall",
         "format": fmt,
@@ -273,9 +296,11 @@ def _parse(body, conf):
         "from": syms_to_id(selfid),
         "category": category,
         "message": syms_to_msg(msg) if msg else "",
-        "eos": EOS_NAMES.get(body[j], body[j]),
-        "ecc_ok": ecc_ok,
-        "dx_rx_conflicts": int(sum(conf[:j + 2])),
+        "eos": EOS_NAMES.get(vals[j], vals[j]),
+        "ecc": status,
+        "ecc_ok": valid,
+        "dx_rx_conflicts": conflicts,
+        "single_copy": single,
     }
 
 
@@ -333,7 +358,12 @@ def read_wav(path):
         with wave.open(path, "rb") as w:
             fs, ch, sw = w.getframerate(), w.getnchannels(), w.getsampwidth()
             raw = w.readframes(w.getnframes())
-        if sw == 2:
+        if sw == 3:
+            b = np.frombuffer(raw, np.uint8).reshape(-1, 3).astype(np.int32)
+            v = b[:, 0] | (b[:, 1] << 8) | (b[:, 2] << 16)
+            v = np.where(v & 0x800000, v - 0x1000000, v)
+            x = v.astype(np.float64) / 2 ** 23
+        elif sw == 2:
             x = np.frombuffer(raw, "<i2").astype(np.float64) / 32768
         elif sw == 1:
             x = (np.frombuffer(raw, np.uint8).astype(np.float64) - 128) / 128
@@ -358,8 +388,8 @@ def fmt_call(c):
     s = "[%7.2fs] %-7s %s -> %s" % (c["time"], c["type"].upper(), c["from"], c["to"])
     if c["message"]:
         s += '  "%s"' % c["message"]
-    s += "  fmt=%s cat=%s %s ECC:%s  f0=%.1fHz %s" % (
-        c["format"], c["category"], c["eos"], "ok" if c["ecc_ok"] else "BAD",
+    s += "  fmt=%s cat=%s %s ECC:%s %s  f0=%.1fHz %s" % (
+        c["format"], c["category"], c["eos"], c["ecc"], "OK" if c["ecc_ok"] else "СОМНИТЕЛЬНО",
         c["center_hz"], c["polarity"])
     if c["dx_rx_conflicts"]:
         s += " conflicts=%d" % c["dx_rx_conflicts"]
@@ -384,6 +414,22 @@ def selftest():
     ok = len(res) == len(tests) and all(
         c["to"] == t[0] and c["from"] == t[1] and c["message"] == (t[2] or "") and c["ecc_ok"]
         for c, t in zip(res, tests))
+    ref = [125, 109, 125, 108, 125, 107, 125, 106, 125, 105, 125, 104, 120, 120, 12, 120, 34, 120,
+           100, 12, 11, 34, 11, 100, 117, 11, 117, 11, 117, 117]
+    frame_ok = build_call("1234", "1111") == ref
+    print("frame matches CODAN recording:", "OK" if frame_ok else "FAIL")
+    ok = ok and frame_ok
+    import os
+    rec = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "testdata",
+                       "SELCALL_from_1111_to_1234.wav")
+    if os.path.exists(rec):
+        x, rfs = read_wav(rec)
+        r = decode(x, rfs)
+        for c in r:
+            print(" ", fmt_call(c))
+        rec_ok = len(r) == 1 and r[0]["from"] == "1111" and r[0]["to"] == "1234" and r[0]["ecc_ok"]
+        print("real recording 1111 -> 1234:", "OK" if rec_ok else "FAIL")
+        ok = ok and rec_ok
     print("SELFTEST", "OK" if ok else "FAIL")
     return ok
 
@@ -399,7 +445,7 @@ def main():
     e.add_argument("--cat", type=int, default=CAT_ROUTINE)
     e.add_argument("--eos", type=int, default=EOS_ACK_RQ, choices=EOS_SET)
     e.add_argument("--fs", type=int, default=48000)
-    e.add_argument("--dot", type=float, default=2.0, help="длина точек, с (для сканирующих приёмников 6+)")
+    e.add_argument("--dot", type=float, default=6.0, help="длина точек, с (для сканирующих приёмников 6+)")
     e.add_argument("--center", type=float, default=F_CENTER)
     e.add_argument("-o", "--out", required=True)
     d = sub.add_parser("decode")

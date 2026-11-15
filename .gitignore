@@ -6,3 +6,4 @@ DerivedData/
 __pycache__/
 *.wav
 .DS_Store
+!testdata/*.wav

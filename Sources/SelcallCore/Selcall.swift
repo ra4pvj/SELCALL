@@ -1,15 +1,19 @@
 // HF Selcall (CCIR 493-4, CODAN/Barrett-compatible): кодер и декодер.
 // Перенос python/selcall.py. Поддерживаются Selcall и Message call.
 //
-// FSK 100 бод, сдвиг 170 Гц, центр 1700 Гц (1615 = "1"/B, 1785 = "0"/Y).
+// FSK 100 бод, сдвиг 170 Гц, центр 1785 Гц (1870 = "1", 1700 = "0" в USB).
 // Символ 10 бит: 7 инф. (LSB первым) + 3 проверочных (число нулей, MSB первым).
-// Кадр: точки -> фазировка (DX=125, RX=111..104) -> F F A.. C S.. [MSG..] EOS ECC.
+// Кадр (по реальной записи SELCALL_from_1111_to_1234.wav):
+//   DX: 125 x6   | F     A.. C S.. [MSG..] EOS EOS EOS
+//   RX: 109..104 | F F F A.. C S.. [MSG..] EOS
+// RX-копия отстаёт от DX на 5 символов, символа ECC нет.
+// Декодер понимает и этот кадр, и вариант M.493 (8 RX фазировки, F F, ECC).
 
 import Foundation
 
 public enum Selcall {
     public static let baud = 100.0
-    public static let defaultCenter = 1700.0
+    public static let defaultCenter = 1785.0
     public static let shift = 170.0
 
     public static let fmtSelcall = 120
@@ -20,7 +24,7 @@ public enum Selcall {
     public static let eosSet: Set<Int> = [117, 122, 127]
 
     static let phaseDX = 125
-    static let phaseRX = [111, 110, 109, 108, 107, 106, 105, 104]
+    static let phaseRX = [109, 108, 107, 106, 105, 104]   // как в записи CODAN
     public static let maxMessage = 64
 
     public static func eosName(_ v: Int) -> String {
@@ -118,11 +122,9 @@ public enum Selcall {
         frD = String(repeating: "0", count: n - frD.count) + frD
         let a = idToSyms(toD), s = idToSyms(frD)
         let m = (message?.isEmpty == false) ? messageToSyms(message!) : []
-        let info = [format] + a + [category] + s + m + [eos]
-        let ecc = info.reduce(0, ^)
-        let body = [format] + info + [ecc]
-        let dx = [Int](repeating: phaseDX, count: 6) + body + [eos, eos]
-        let rx = phaseRX + body
+        let rest = a + [category] + s + m
+        let dx = [Int](repeating: phaseDX, count: 6) + [format] + rest + [eos, eos, eos]
+        let rx = phaseRX + [format, format, format] + rest + [eos]
         var stream = [Int]()
         stream.reserveCapacity(dx.count * 2)
         for i in 0..<dx.count {
@@ -137,7 +139,7 @@ public enum Selcall {
         Double(Int(dotSeconds * baud) / 2 * 2 + stream.count * 10) / baud
     }
 
-    public static func modulate(_ stream: [Int], sampleRate fs: Double, dotSeconds: Double = 2.0,
+    public static func modulate(_ stream: [Int], sampleRate fs: Double, dotSeconds: Double = 6.0,
                                 center: Double = defaultCenter, amplitude: Double = 0.5) -> [Float] {
         let ndots = Int(dotSeconds * baud) / 2 * 2
         var bits = [UInt8]()
@@ -147,7 +149,7 @@ public enum Selcall {
         let n = Int((Double(bits.count) * fs / baud).rounded())
         guard n > 0 else { return [] }
         var out = [Float](repeating: 0, count: n)
-        let f1 = center - shift / 2, f0 = center + shift / 2
+        let f1 = center + shift / 2, f0 = center - shift / 2
         let ramp = max(1, Int(0.005 * fs))
         var phase = 0.0
         for t in 0..<n {
@@ -164,7 +166,7 @@ public enum Selcall {
 
     // MARK: демодулятор
 
-    /// |Y(f1)| - |Y(f0)| со скользящим окном длиной в бит (как numpy convolve mode="same").
+    /// |Y(верхний)| - |Y(нижний)| со скользящим окном длиной в бит (как numpy convolve mode="same").
     static func toneDiff(_ x: [Float], fs: Double, center: Double) -> [Float] {
         let n = x.count
         let L = max(1, Int((fs / baud).rounded()))
@@ -192,7 +194,7 @@ public enum Selcall {
             }
             return out
         }
-        let m1 = mag(center - shift / 2), m0 = mag(center + shift / 2)
+        let m1 = mag(center + shift / 2), m0 = mag(center - shift / 2)
         var d = [Float](repeating: 0, count: n)
         for i in 0..<n { d[i] = Float(m1[i] - m0[i]) }
         return d
@@ -204,13 +206,9 @@ public enum Selcall {
         var call: DecodedCall
     }
 
-    static let template: [(slot: Int, val: Int)] = {
-        var t = [(slot: Int, val: Int)]()
-        for i in 0..<6 { t.append((slot: 2 * i, val: phaseDX)) }
-        for i in 0..<8 { t.append((slot: 2 * i + 1, val: phaseRX[i])) }
-        return t
-    }()
-
+    /// Ищем фазировку. Якорь q — позиция (в битах) символа RX0 = 104.
+    /// Счёт: RX-фазировка 104+i в q-20i и DX 125 в q-10-20m. Подходит и для
+    /// короткой (6 RX, CODAN), и для полной (8 RX, M.493) фазировки.
     static func findCalls(bits: [UInt8]) -> [Found] {
         let N = bits.count
         guard N >= 400 else { return [] }
@@ -221,91 +219,111 @@ public enum Selcall {
             for i in 0..<10 { w |= Int(bits[n + i]) << i }
             sym[n] = symLUT[w]
         }
-        let span = 160
-        guard M > span else { return [] }
-        let P = M - span
+        func at(_ j: Int) -> Int { j >= 0 && j < M ? Int(sym[j]) : -1 }
         var cands = [(pos: Int, score: Int)]()
-        for p in 0..<P {
+        for q in 0..<M {
             var sc = 0
-            for t in template where Int(sym[p + t.slot * 10]) == t.val { sc += 1 }
-            if sc >= 8 { cands.append((p, sc)) }
+            for i in 0..<8 {
+                if at(q - 20 * i) == 104 + i { sc += 1 }
+                if at(q - 10 - 20 * i) == phaseDX { sc += 1 }
+            }
+            if sc >= 7 { cands.append((q, sc)) }
         }
         cands.sort { $0.score != $1.score ? $0.score > $1.score : $0.pos < $1.pos }
         var taken = [Int]()
         var out = [Found]()
         for c in cands where taken.allSatisfy({ abs($0 - c.pos) > 200 }) {
             taken.append(c.pos)
-            if let call = extract(sym, c.pos) {
-                out.append(Found(pos: c.pos, score: c.score, call: call))
+            if var call = extract(sym, c.pos) {
+                call.endBit += c.pos
+                out.append(Found(pos: max(0, c.pos - 230), score: c.score, call: call))
             }
         }
         return out
     }
 
-    static func extract(_ sym: [Int16], _ p: Int, maxBody: Int = 90) -> DecodedCall? {
+    struct Item {
+        var value: Int?
+        var conflict: Bool
+        var copies: Int
+    }
+
+    /// Логическая последовательность L[k]: DX в q+10+20k и его RX-копия в q+60+20k.
+    static func extract(_ sym: [Int16], _ q: Int, maxLen: Int = 90) -> DecodedCall? {
         let M = sym.count
-        func slot(_ i: Int) -> Int? {
-            let j = p + 10 * i
-            guard j < M else { return nil }
+        func at(_ j: Int) -> Int? {
+            guard j >= 0, j < M else { return nil }
             let v = Int(sym[j])
             return v >= 0 ? v : nil
         }
-        var body = [Int?](), conf = [Bool]()
-        for k in 0..<maxBody {
-            let d = slot(2 * (6 + k))        // DX копия
-            let r = slot(2 * (8 + k) + 1)    // RX копия
-            if let d = d {
-                body.append(d)
-                conf.append(r != nil && r! != d)
-            } else {
-                body.append(r)
-                conf.append(false)
+        var L = [Item]()
+        for k in -2..<maxLen {
+            var d = at(q + 10 + 20 * k), r = at(q + 60 + 20 * k)
+            if d == phaseDX { d = nil }
+            if let rv = r, (104...111).contains(rv) { r = nil }
+            switch (d, r) {
+            case (nil, nil): L.append(Item(value: nil, conflict: false, copies: 0))
+            case (let dv?, nil): L.append(Item(value: dv, conflict: false, copies: 1))
+            case (nil, let rv?): L.append(Item(value: rv, conflict: false, copies: 1))
+            case (let dv?, let rv?): L.append(Item(value: dv, conflict: dv != rv, copies: dv == rv ? 2 : 1))
             }
+            if k > 6, L.suffix(3).allSatisfy({ $0.value == nil }) { break }
         }
-        return parse(body, conf)
+        return parse(L)
     }
 
-    static func parse(_ body: [Int?], _ conf: [Bool]) -> DecodedCall? {
-        guard body.count > 2, let fmt = body[0] ?? body[1] else { return nil }
-        var i = 2
+    static func parse(_ L: [Item]) -> DecodedCall? {
+        let vals = L.map { $0.value }
+        var i = 0
+        while i < vals.count, i < 3, vals[i] == nil { i += 1 }
+        guard i < vals.count, let fmt = vals[i], fmt >= 100, !eosSet.contains(fmt) else { return nil }
+        i += 1
+        while i < vals.count, vals[i] == fmt { i += 1 }
         var addr = [Int]()
-        while i < body.count, let v = body[i], v < 100, addr.count < 5 {
+        while i < vals.count, let v = vals[i], v < 100, addr.count < 5 {
             addr.append(v)
             i += 1
         }
-        guard !addr.isEmpty, i < body.count, let category = body[i] else { return nil }
+        guard !addr.isEmpty, i < vals.count, let category = vals[i], category >= 100 else { return nil }
         i += 1
-        guard i + addr.count <= body.count else { return nil }
+        guard i + addr.count <= vals.count else { return nil }
         var selfID = [Int]()
         for k in i..<(i + addr.count) {
-            guard let v = body[k], v < 100 else { return nil }
+            guard let v = vals[k], v < 100 else { return nil }
             selfID.append(v)
         }
         i += addr.count
         let head = [fmt] + addr + [category] + selfID
-        var best: (j: Int, ok: Bool)? = nil
-        let upper = min(body.count - 1, i + maxMessage + 1)
+        var best: (j: Int, status: String, complete: Bool)? = nil
+        let upper = min(vals.count, i + maxMessage + 1)
         if upper > i {
             for j in i..<upper {
-                guard let e = body[j], eosSet.contains(e) else { continue }
-                let msg = body[i..<j]
-                var ok = false
-                if msg.allSatisfy({ $0 != nil }), let eccRx = body[j + 1] {
+                guard let e = vals[j], eosSet.contains(e) else { continue }
+                let msg = vals[i..<j]
+                let nxt: Int? = j + 1 < vals.count ? vals[j + 1] : nil
+                var status = "BAD"
+                if msg.allSatisfy({ $0 != nil }) {
                     let ecc = (head + msg.map { $0! } + [e]).reduce(0, ^)
-                    ok = (ecc == eccRx)
+                    if nxt == ecc { status = "ok" } else if nxt == nil || nxt == e { status = "нет" }
                 }
-                if ok { best = (j, true); break }
-                if best == nil { best = (j, false) }
+                if status != "BAD" { best = (j, status, nxt != nil); break }
+                if best == nil { best = (j, status, nxt != nil) }
             }
         }
-        guard let b = best, let eos = body[b.j] else { return nil }
-        let msgSyms = Array(body[i..<b.j])
-        let conflicts = conf.prefix(b.j + 2).filter { $0 }.count
-        return DecodedCall(time: 0, format: fmt, to: symsToId(addr), from: symsToId(selfID),
-                           category: category,
-                           message: msgSyms.isEmpty ? "" : symsToMessage(msgSyms),
-                           eos: eos, eccOK: b.ok, conflicts: conflicts,
-                           center: 0, inverted: false, phasingScore: 0)
+        guard let b = best, let eos = vals[b.j] else { return nil }
+        let msgSyms = Array(vals[i..<b.j])
+        let seg = L.prefix(b.j + 1)
+        let conflicts = seg.filter { $0.conflict }.count
+        let valid = b.status == "ok" ||
+            (b.status == "нет" && conflicts == 0 && !msgSyms.contains(where: { $0 == nil }))
+        var call = DecodedCall(time: 0, format: fmt, to: symsToId(addr), from: symsToId(selfID),
+                               category: category,
+                               message: msgSyms.isEmpty ? "" : symsToMessage(msgSyms),
+                               eos: eos, ecc: b.status, eccOK: valid, conflicts: conflicts,
+                               center: 0, inverted: false, phasingScore: 0)
+        call.complete = b.complete
+        call.endBit = 70 + 20 * (b.j - 2)        // относительно якоря q; extract/findCalls добавят q
+        return call
     }
 
     /// Декодирование на одном центре. `x` — моно, любая fs (быстрее всего 8000).
@@ -329,6 +347,7 @@ public enum Selcall {
                 for f in findCalls(bits: bits) {
                     var c = f.call
                     c.time = Double(idx[f.pos]) / fs
+                    c.endTime = Double(idx[min(idx.count - 1, max(0, c.endBit))]) / fs
                     c.center = center
                     c.inverted = inv
                     c.phasingScore = f.score
@@ -378,11 +397,19 @@ public struct DecodedCall: Identifiable, Equatable {
     public var category: Int
     public var message: String
     public var eos: Int
+    /// "ok" — ECC совпал, "нет" — символа ECC нет (кадр CODAN), "BAD" — ошибка.
+    public var ecc: String
+    /// Вызов принят надёжно: ECC ok, либо ECC нет и все копии DX/RX согласованы.
     public var eccOK: Bool
     public var conflicts: Int
     public var center: Double
     public var inverted: Bool
     public var phasingScore: Int
+    /// После EOS виден следующий символ (повтор EOS или ECC) — кадр точно закончен.
+    public var complete: Bool = true
+    /// Время конца кадра (с), в той же шкале, что и `time`.
+    public var endTime: Double = 0
+    var endBit: Int = 0
 
     public var isMessage: Bool { !message.isEmpty }
     public var eosName: String { Selcall.eosName(eos) }
@@ -390,8 +417,8 @@ public struct DecodedCall: Identifiable, Equatable {
     public var summary: String {
         var s = String(format: "[%7.2fs] %@ %@ -> %@", time, isMessage ? "MESSAGE" : "SELCALL", from, to)
         if isMessage { s += "  \"\(message)\"" }
-        s += String(format: "  fmt=%d cat=%d %@ ECC:%@  f0=%.1fHz %@", format, category, eosName,
-                    eccOK ? "ok" : "BAD", center, inverted ? "inverted" : "normal")
+        s += String(format: "  fmt=%d cat=%d %@ ECC:%@ %@  f0=%.1fHz %@", format, category, eosName,
+                    ecc, eccOK ? "OK" : "СОМНИТЕЛЬНО", center, inverted ? "inverted" : "normal")
         if conflicts > 0 { s += " conflicts=\(conflicts)" }
         return s
     }

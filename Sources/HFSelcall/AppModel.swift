@@ -57,7 +57,7 @@ final class AppModel: ObservableObject {
 
     init() {
         myID = defaults.string(forKey: "myID") ?? "1234"
-        dotSeconds = defaults.object(forKey: "dotSeconds") as? Double ?? 2.0
+        dotSeconds = defaults.object(forKey: "dotSeconds") as? Double ?? 6.0
         txLevel = defaults.object(forKey: "txLevel") as? Double ?? 0.5
         autoAck = defaults.object(forKey: "autoAck") as? Bool ?? true
         transliterate = defaults.object(forKey: "translit") as? Bool ?? true
@@ -153,8 +153,8 @@ final class AppModel: ObservableObject {
         case (true, _): title = "Сообщение"
         default: title = "Вызов"
         }
-        let detail = String(format: "fmt %d · cat %d · %@ · ECC %@ · %.1f Гц%@%@",
-                            c.format, c.category, c.eosName, c.eccOK ? "ok" : "ОШИБКА", c.center,
+        let detail = String(format: "fmt %d · cat %d · %@ · ECC %@ · %@ · %.1f Гц%@%@",
+                            c.format, c.category, c.eosName, c.ecc, c.eccOK ? "принят" : "СОМНИТЕЛЬНО", c.center,
                             c.inverted ? " · LSB" : "", c.conflicts > 0 ? " · исправлено \(c.conflicts)" : "")
         log.append(LogEntry(date: date, kind: .rx, from: c.from, to: c.to,
                             title: title + (mine ? " мне" : "") + (fromFile ? " (файл)" : ""),

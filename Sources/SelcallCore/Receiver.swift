@@ -180,8 +180,11 @@ public final class Receiver {
         for var c in calls {
             let absT = t0 + c.time
             if reported.contains(where: { abs($0 - absT) < 1.0 }) { continue }
+            // кадр без завершающего символа после EOS: ждём ещё 1,5 с (EOS мог оказаться буквой текста)
+            if !c.complete && !flush && end - (t0 + c.endTime) < 1.5 { continue }
             if !c.eccOK && !flush && end - absT < 20 { continue }
             c.time = absT
+            c.endTime += t0
             reported.append(absT)
             out.append(c)
         }
