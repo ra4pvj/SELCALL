@@ -112,6 +112,7 @@ struct ContentView: View {
                         .frame(width: 100, alignment: .trailing)
                 }
                 HStack(spacing: 8) {
+                    RxLamp(on: m.rxActive, receiving: m.receiving)
                     TxLamp(on: m.transmitting, keyed: m.pttKeyed)
                     Button { m.toggleListen() } label: {
                         HStack(spacing: 4) {
@@ -442,6 +443,21 @@ struct SettingsView: View {
                          + "Кнопка «Слушать» на панели включает прослушивание вручную.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
+                Section("Прослушивание эфира после передачи вызова") {
+                    Toggle("Включать после своего вызова или сообщения (чтобы услышать ответ станции)",
+                           isOn: $m.listenAfterTx)
+                    HStack {
+                        Text("Время прослушивания")
+                        Slider(value: $m.listenAfterTxSeconds, in: 5...600, step: 5)
+                        Text(m.listenAfterTxSeconds >= 60
+                             ? String(format: "%d:%02d", Int(m.listenAfterTxSeconds) / 60, Int(m.listenAfterTxSeconds) % 60)
+                             : String(format: "%.0f с", m.listenAfterTxSeconds))
+                            .monospacedDigit().frame(width: 50)
+                    }
+                    Text("Передан вызов → вход звучит на устройствах самоконтроля (или на системном выходе) "
+                         + "заданное время, затем выключается.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 Section("Самоконтроль (можно несколько устройств)") {
                     Toggle("Слушать эфир (вход)", isOn: $m.monitorRX)
                     Toggle("Слушать свою передачу", isOn: $m.monitorTX)
@@ -538,6 +554,21 @@ struct TxLamp: View {
             Text("TX").font(.caption.bold()).foregroundStyle(on || keyed ? Color.red : Color.secondary)
         }
         .help(keyed ? "PTT включён — идёт передача" : "Передача выключена")
+    }
+}
+
+struct RxLamp: View {
+    var on: Bool
+    var receiving: Bool
+    var body: some View {
+        HStack(spacing: 4) {
+            Circle()
+                .fill(on ? Color.green : Color.secondary.opacity(0.3))
+                .frame(width: 10, height: 10)
+            Text("RX").font(.caption.bold()).foregroundStyle(on ? Color.green : Color.secondary)
+        }
+        .help(on ? "Приём: вход слушается и декодируется"
+              : (receiving ? "Приём заглушён на время передачи" : "Приём выключен"))
     }
 }
 

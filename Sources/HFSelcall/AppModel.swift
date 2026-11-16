@@ -62,6 +62,9 @@ final class AppModel: ObservableObject {
     @Published var listenAfterCall: Bool { didSet { defaults.set(listenAfterCall, forKey: "listenAfterCall") } }
     @Published var listenSeconds: Double { didSet { defaults.set(listenSeconds, forKey: "listenSeconds") } }
     @Published var listening = false        // вход сейчас слышен (по вызову или вручную)
+    // прослушивание эфира после передачи своего вызова (чтобы услышать ответ станции)
+    @Published var listenAfterTx: Bool { didSet { defaults.set(listenAfterTx, forKey: "listenAfterTx") } }
+    @Published var listenAfterTxSeconds: Double { didSet { defaults.set(listenAfterTxSeconds, forKey: "listenAfterTxSeconds") } }
     @Published var listenManual = false
     @Published var extManual = false        // включён вручную (без таймера)
     /// Сигнал ответа в эфир — выбирается отдельно от звонка.
@@ -120,7 +123,8 @@ final class AppModel: ObservableObject {
     private let ext = ExtControl()
     private var extTimer: DispatchWorkItem?
     private var listenTimer: DispatchWorkItem?
-    private var listenPending = false       // включить прослушивание после окончания ответа в эфир
+    /// включить прослушивание на N секунд, когда закончится передача (ответ в эфир или свой вызов)
+    private var listenPending: Double?
     private var watchdog: DispatchWorkItem?
 
     init() {
@@ -154,6 +158,8 @@ final class AppModel: ObservableObject {
         extSeconds = defaults.object(forKey: "extSeconds") as? Double ?? 5
         listenAfterCall = defaults.object(forKey: "listenAfterCall") as? Bool ?? true
         listenSeconds = defaults.object(forKey: "listenSeconds") as? Double ?? 60
+        listenAfterTx = defaults.object(forKey: "listenAfterTx") as? Bool ?? true
+        listenAfterTxSeconds = defaults.object(forKey: "listenAfterTxSeconds") as? Double ?? 60
         ringVolume = defaults.object(forKey: "ringVolume") as? Double ?? 0.5
         ringSeconds = defaults.object(forKey: "ringSeconds") as? Double ?? 30
         ringOnAir = defaults.object(forKey: "ringOnAir") as? Bool ?? true
@@ -326,7 +332,7 @@ final class AppModel: ObservableObject {
     /// Кнопка «Слушать» на панели: включить / выключить вручную.
     func toggleListen() {
         listenTimer?.cancel()
-        listenPending = false
+        listenPending = nil
         if listening {
             listenManual = false
             setListening(false)
@@ -491,7 +497,7 @@ final class AppModel: ObservableObject {
             if extEnabled && !extPort.isEmpty { extPulse() }
             if listenAfterCall {
                 // после ответа в эфир (если он включён) — сразу открыть вход
-                if ringOnAir { listenPending = true } else { startListen() }
+                if ringOnAir { listenPending = listenSeconds } else { startListen() }
             }
             if ringOnAir {
                 // небольшая пауза: вызывающая станция успевает перейти на приём
@@ -503,13 +509,25 @@ final class AppModel: ObservableObject {
 
     // MARK: передача
 
-    func sendSelcall() { send(to: toID, message: nil, eos: Selcall.eosAckRQ, title: "Вызов") }
+    func sendSelcall() {
+        send(to: toID, message: nil, eos: Selcall.eosAckRQ, title: "Вызов")
+        armListenAfterTx()
+    }
 
     func sendMessage() {
         guard !messageText.trimmingCharacters(in: .whitespaces).isEmpty else { return }
         send(to: toID, message: messageText, eos: Selcall.eosAckRQ, title: "Сообщение")
         messageText = ""
+        armListenAfterTx()
     }
+
+    /// После передачи своего вызова — слушать эфир, чтобы услышать ответ станции.
+    private func armListenAfterTx() {
+        if listenAfterTx && transmitting { listenPending = listenAfterTxSeconds }
+    }
+
+    /// Вход сейчас реально слушается (для лампы RX): приём включён и не заглушён передачей.
+    var rxActive: Bool { receiving && !(transmitting && muteRxOnTx) }
 
     private func prepared(_ message: String?) -> String? {
         guard let m = message, !m.isEmpty else { return nil }
@@ -608,10 +626,10 @@ final class AppModel: ObservableObject {
         watchdog?.cancel()
         watchdog = nil
         keyPTT(false)
-        if listenPending {
-            listenPending = false
+        if let sec = listenPending {
+            listenPending = nil
             // вход размьютится через 0,5 с после передачи — тогда и слушаем
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.startListen() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.startListen(sec) }
         }
         transmitting = false
         if muteRxOnTx { muteUntil = Date().addingTimeInterval(0.5) }
