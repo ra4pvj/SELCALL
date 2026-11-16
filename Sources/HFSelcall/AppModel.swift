@@ -165,6 +165,11 @@ final class AppModel: ObservableObject {
         refreshDevices()
         audio.inputChannel = inputChannel
         audio.onSamples = { [weak self] x, peak in self?.onSamples(x, peak) }
+        audio.onRxConfigurationChange = { [weak self] in
+            guard let self = self, self.receiving else { return }
+            self.addInfo("Звуковое устройство перестроено — приём перезапущен")
+            self.restartRxKeepingState()
+        }
         reopenPTT()
         monitor.level = Float(monitorLevel)
         applyMonitor()
@@ -384,6 +389,16 @@ final class AppModel: ObservableObject {
                 self.receiving = false
                 self.addError("Не удалось запустить приём: \(error.localizedDescription)")
             }
+        }
+    }
+
+    /// Перезапуск движка приёма без сброса декодера (после перестройки устройства macOS).
+    private func restartRxKeepingState() {
+        do {
+            if let warn = try audio.startRx(device: inputDevice) { addError(warn) }
+        } catch {
+            addError("Не удалось перезапустить приём: \(error.localizedDescription)")
+            stopRx()
         }
     }
 

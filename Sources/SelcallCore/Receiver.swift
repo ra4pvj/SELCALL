@@ -135,9 +135,10 @@ public final class Receiver {
     private let afc: AFC
     private var reported = [Double]()          // абсолютные времена выданных вызовов
     /// Недавно выданные вызовы по содержимому (от, кому, текст, EOS) -> абсолютное время:
-    /// тот же вызов в течение `repeatWindow` секунд повторно не выдаётся.
+    /// тот же вызов в пределах `repeatWindow` секунд повторно не выдаётся (защита от дублей при
+    /// сдвиге окна анализа). Окно короткое: настоящий повторный вызов раньше 8 с не начнётся.
     private var recent = [String: Double]()
-    public var repeatWindow = 120.0
+    public var repeatWindow = 8.0
 
     public init(sampleRate: Double = 8000, windowSeconds: Double = 60) {
         fs = sampleRate

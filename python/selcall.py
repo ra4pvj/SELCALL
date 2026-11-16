@@ -365,7 +365,7 @@ class StreamReceiver:
         self.afc_seconds = afc_seconds
         self.fixed_center = None
         self.last_centers = []
-        self.repeat_window = 120.0
+        self.repeat_window = 8.0     # дубль того же вызова (сдвиг окна); настоящий повтор раньше 8 с не начнётся
         self.reset()
 
     def reset(self):
@@ -511,7 +511,19 @@ def selftest():
         rx.append(np.zeros(800))
         if (i // 800) % 10 == 9:
             got += rx.process()
-    stream_ok = len(got) == len(tests) and all(c["ecc_ok"] for c in got)
+    # тот же вызов ещё дважды (через ~15 с): оба должны быть приняты — одинаковые вызовы не глушатся
+    same = modulate(build_call("1234", "5678"), 8000, 6.0, 1785)
+    for rep_ in range(2):
+        z = np.concatenate((same, np.zeros(8000 * 3)))
+        for i in range(0, len(z), 800):
+            rx.append(z[i:i + 800])
+            if (i // 800) % 10 == 9:
+                got += rx.process()
+    for i in range(0, 8000 * 40, 800):
+        rx.append(np.zeros(800))
+        if (i // 800) % 10 == 9:
+            got += rx.process()
+    stream_ok = len(got) == len(tests) + 2 and all(c["ecc_ok"] for c in got)
     print("stream decode:", "OK" if stream_ok else "FAIL (%d)" % len(got))
     ok = ok and stream_ok
     ref = [125, 109, 125, 108, 125, 107, 125, 106, 125, 105, 125, 104, 120, 120, 12, 120, 34, 120,

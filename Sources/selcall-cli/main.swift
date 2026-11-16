@@ -107,7 +107,23 @@ case "selftest":
         rx.append([Float](repeating: 0, count: 8000))
         if k % 2 == 1 { got += rx.process() }
     }
-    let streamOK = got.count == tests.count && got.allSatisfy { $0.eccOK }
+    // тот же вызов ещё дважды (через ~15 с): оба должны быть приняты, лишних — нет
+    let same = Selcall.modulate(Selcall.buildCall(to: "1234", from: "5678"), sampleRate: fs, dotSeconds: 6.0)
+    for _ in 0..<2 {
+        let z = same + [Float](repeating: 0, count: 24000)
+        var j = 0
+        while j < z.count {
+            let e = min(z.count, j + 8000)
+            rx.append(Array(z[j..<e]))
+            got += rx.process()
+            j = e
+        }
+    }
+    for _ in 0..<40 {
+        rx.append([Float](repeating: 0, count: 8000))
+        got += rx.process()
+    }
+    let streamOK = got.count == tests.count + 2 && got.allSatisfy { $0.eccOK }
     print("stream decode:", streamOK ? "OK" : "FAIL (\(got.count) calls)")
     got.forEach { print("  ", $0.summary) }
     ok = ok && streamOK
