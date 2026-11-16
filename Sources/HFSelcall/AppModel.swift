@@ -73,7 +73,7 @@ final class AppModel: ObservableObject {
     @Published var monitorLevel: Double { didSet { defaults.set(monitorLevel, forKey: "monLevel"); monitor.level = Float(monitorLevel) } }
     @Published var ringVolume: Double { didSet { defaults.set(ringVolume, forKey: "ringVolume") } }
     @Published var ringSeconds: Double { didSet { defaults.set(ringSeconds, forKey: "ringSeconds") } }
-    /// Ответный звонок в эфир (как у CODAN / Vertex): вызывающая станция слышит, что вызов принят.
+    /// Ответ в эфир: вызывающая станция слышит, что вызов принят.
     @Published var ringOnAir: Bool { didSet { defaults.set(ringOnAir, forKey: "ringOnAir") } }
     @Published var transliterate: Bool { didSet { defaults.set(transliterate, forKey: "translit") } }
     @Published var autoAFC: Bool { didSet { defaults.set(autoAFC, forKey: "autoAFC"); applyCenter() } }

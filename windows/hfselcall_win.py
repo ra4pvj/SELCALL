@@ -86,7 +86,7 @@ PTT_TITLES = {"none": "нет (VOX / внешний PTT)", "RTS": "RTS", "DTR": 
               "ICOM": "ICOM (CI-V)", "YAESU": "YAESU (TX1;/TX0;)", "YAESU-OLD": "YAESU-OLD (FT-817/857/897)",
               "KENWOOD": "KENWOOD (TX;/RX;)", "ELECRAFT": "ELECRAFT (TX;/RX;)"}
 IN_CHANNELS = ["Авто (где есть сигнал)", "1 (левый)", "2 (правый)"]
-RING_STYLES = [("codan", "Двухтональный (как CODAN)"), ("vertex", "Трель (как Vertex)"),
+RING_STYLES = [("codan", "Двухтональный"), ("vertex", "Трель"),
                ("beep", "Короткие гудки"), ("kalinka", "Мелодия «Калинка»")]
 
 # Начало припева «Калинки» (И. Ларионов, 1860; общественное достояние) по нотам, на октаву выше записи:
@@ -767,7 +767,7 @@ class Core:
         return None
 
     def send_ring(self, to_id):
-        """Ответ в эфир (как CODAN / Vertex): сигнал ответа (отдельный от звонка) звучит один раз —
+        """Ответ в эфир: сигнал ответа (отдельный от звонка) звучит один раз —
         мелодия целиком (~2,9 с) или тоны 2,5 с; передача = задержка PTT + сигнал + хвост."""
         if sd is None:
             return "Звуковая библиотека недоступна: %s" % SD_ERROR
@@ -961,53 +961,65 @@ class App:
     # ---- построение окна
     def _build(self):
         root = self.root
+        # верхняя панель: ID | вход и выход друг под другом | индикаторы и кнопки в два ряда
+        # (поля выбора устройств растягиваются и не пропадают в узком окне)
         top = ttk.Frame(root, padding=(8, 6))
         top.pack(fill="x")
-        ttk.Label(top, text="Мой ID").pack(side="left")
-        e = ttk.Entry(top, textvariable=self.v["my_id"], width=9, font=self.font_mono)
-        e.pack(side="left", padx=(4, 10))
+        idf = ttk.Frame(top)
+        idf.grid(row=0, column=0, rowspan=2, sticky="w", padx=(0, 12))
+        ttk.Label(idf, text="Мой ID").pack(anchor="w")
+        e = ttk.Entry(idf, textvariable=self.v["my_id"], width=9, font=self.font_mono)
+        e.pack(anchor="w")
         e.bind("<FocusOut>", lambda ev: self.store("my_id", digits(self.v["my_id"].get())))
-        ttk.Label(top, text="Вход").pack(side="left")
-        self.cb_in = ttk.Combobox(top, textvariable=self.v["in_dev"], width=24, state="readonly")
-        self.cb_in.pack(side="left", padx=(4, 8))
+        ttk.Label(top, text="Вход").grid(row=0, column=1, sticky="e", padx=(0, 4), pady=2)
+        self.cb_in = ttk.Combobox(top, textvariable=self.v["in_dev"], width=30, state="readonly")
+        self.cb_in.grid(row=0, column=2, sticky="ew", pady=2)
         self.cb_in.bind("<<ComboboxSelected>>", lambda ev: self.on_dev("in_dev", self.v["in_dev"].get()))
-        ttk.Label(top, text="Выход").pack(side="left")
-        self.cb_out = ttk.Combobox(top, textvariable=self.v["out_dev"], width=24, state="readonly")
-        self.cb_out.pack(side="left", padx=(4, 4))
+        ttk.Button(top, text="↻", width=3, command=self.refresh_devices).grid(row=0, column=3, padx=4)
+        ttk.Label(top, text="Выход").grid(row=1, column=1, sticky="e", padx=(0, 4), pady=2)
+        self.cb_out = ttk.Combobox(top, textvariable=self.v["out_dev"], width=30, state="readonly")
+        self.cb_out.grid(row=1, column=2, sticky="ew", pady=2)
         self.cb_out.bind("<<ComboboxSelected>>", lambda ev: self.on_dev("out_dev", self.v["out_dev"].get()))
-        ttk.Button(top, text="↻", width=3, command=self.refresh_devices).pack(side="left", padx=(0, 8))
+        top.columnconfigure(2, weight=1, minsize=160)
 
-        self.btn_rx = ttk.Button(top, text="Приём", command=self.toggle_rx)
-        self.btn_rx.pack(side="right")
-        ttk.Button(top, text="Настройки", command=self.open_settings).pack(side="right", padx=4)
-        ttk.Label(top, textvariable=self.v["afc"], width=14, font=self.font_mono).pack(side="right", padx=4)
-        self.db_lbl = ttk.Label(top, text="  —  дБ", width=8, font=self.font_mono)
-        self.db_lbl.pack(side="right")
-        self.meter = tk.Canvas(top, width=110, height=12, highlightthickness=1, highlightbackground="#999")
-        self.meter.pack(side="right", padx=4)
+        # правая колонка, ряд 1: индикатор уровня, канал, АПЧ
+        r1 = ttk.Frame(top)
+        r1.grid(row=0, column=4, sticky="e", padx=(12, 0))
+        self.meter = tk.Canvas(r1, width=110, height=12, highlightthickness=1, highlightbackground="#999")
+        self.meter.pack(side="left", padx=4)
         self.meter_bar = self.meter.create_rectangle(0, 0, 0, 12, fill="#3a3", width=0)
         for m in (-40, -20, -12, -6, -3):             # риски шкалы дБFS
             x = 110 * (m + 60) / 60.0
             self.meter.create_line(x, 0, x, 12, fill="#777")
-        self.ch_lbl = ttk.Label(top, text="", width=6)
-        self.ch_lbl.pack(side="right")
-        self.btn_listen = ttk.Button(top, text="Слушать", width=9, command=self.core.toggle_listen)
-        self.btn_listen.pack(side="right", padx=2)
-        ls_c = tk.Canvas(top, width=14, height=14, highlightthickness=0)
-        ls_c.pack(side="right")
-        self.listen_lamp = ls_c.create_oval(2, 2, 12, 12, fill="#bbb", outline="")
-        self.listen_canvas = ls_c
-        self.btn_ext = ttk.Button(top, text="Внешн.", width=11, command=self.ext_toggle)
-        self.btn_ext.pack(side="right", padx=2)
-        ext_c = tk.Canvas(top, width=14, height=14, highlightthickness=0)
-        ext_c.pack(side="right")
-        self.ext_lamp = ext_c.create_oval(2, 2, 12, 12, fill="#bbb", outline="")
-        self.ext_canvas = ext_c
-        lamp = tk.Canvas(top, width=40, height=14, highlightthickness=0)
-        lamp.pack(side="right", padx=4)
+        self.db_lbl = ttk.Label(r1, text="  —  дБ", width=8, font=self.font_mono)
+        self.db_lbl.pack(side="left")
+        self.ch_lbl = ttk.Label(r1, text="", width=6)
+        self.ch_lbl.pack(side="left")
+        ttk.Label(r1, textvariable=self.v["afc"], width=14, font=self.font_mono).pack(side="left", padx=4)
+
+        # ряд 2: TX, Слушать, Внешн., Приём, Настройки
+        r2 = ttk.Frame(top)
+        r2.grid(row=1, column=4, sticky="e", padx=(12, 0))
+        lamp = tk.Canvas(r2, width=40, height=14, highlightthickness=0)
+        lamp.pack(side="left", padx=4)
         self.lamp = lamp.create_oval(2, 2, 12, 12, fill="#bbb", outline="")
         lamp.create_text(26, 7, text="TX", font=("Segoe UI", 8, "bold"))
         self.lamp_canvas = lamp
+        ls_c = tk.Canvas(r2, width=14, height=14, highlightthickness=0)
+        ls_c.pack(side="left")
+        self.listen_lamp = ls_c.create_oval(2, 2, 12, 12, fill="#bbb", outline="")
+        self.listen_canvas = ls_c
+        self.btn_listen = ttk.Button(r2, text="Слушать", width=9, command=self.core.toggle_listen)
+        self.btn_listen.pack(side="left", padx=2)
+        ext_c = tk.Canvas(r2, width=14, height=14, highlightthickness=0)
+        ext_c.pack(side="left")
+        self.ext_lamp = ext_c.create_oval(2, 2, 12, 12, fill="#bbb", outline="")
+        self.ext_canvas = ext_c
+        self.btn_ext = ttk.Button(r2, text="Внешн.", width=11, command=self.ext_toggle)
+        self.btn_ext.pack(side="left", padx=2)
+        self.btn_rx = ttk.Button(r2, text="Приём", command=self.toggle_rx)
+        self.btn_rx.pack(side="left", padx=2)
+        ttk.Button(r2, text="Настройки", command=self.open_settings).pack(side="left", padx=2)
 
         self.banner = tk.Frame(root, bg="#ffe2b8")
         self.banner_lbl = tk.Label(self.banner, bg="#ffe2b8", font=("Segoe UI", 11, "bold"), anchor="w",
@@ -1446,7 +1458,7 @@ class SettingsWindow:
         ttk.Button(f, text="Прослушать", command=self.test_ring).grid(row=2, column=2, **pad)
         ttk.Label(f, text="Не дольше, с").grid(row=3, column=0, **pad)
         ttk.Spinbox(f, from_=5, to=300, increment=5, textvariable=v["ring_sec"], width=6).grid(row=3, column=1, **pad)
-        ttk.Checkbutton(f, text="Ответ в эфир — вызывающая станция слышит, что вызов\nпринят (как CODAN / Vertex; один раз, уровень передачи)",
+        ttk.Checkbutton(f, text="Ответ в эфир — вызывающая станция слышит, что вызов\nпринят (один раз, уровень передачи)",
                         variable=v["ring_air"]).grid(row=4, column=0, columnspan=3, **pad)
         ttk.Label(f, text="Сигнал ответа").grid(row=5, column=0, **pad)
         ttk.Combobox(f, textvariable=v["answer_style"], values=[t for _, t in RING_STYLES], state="readonly",

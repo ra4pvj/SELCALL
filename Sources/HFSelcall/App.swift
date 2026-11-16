@@ -63,61 +63,83 @@ struct ContentView: View {
         }
     }
 
+    // Верхняя панель в три колонки: ID | вход и выход друг под другом | индикаторы и кнопки в два ряда.
+    // Поля выбора устройств растягиваются и не пропадают в узком окне.
     private var topBar: some View {
-        HStack(spacing: 12) {
-            HStack(spacing: 4) {
-                Text("Мой ID").foregroundStyle(.secondary)
+        HStack(alignment: .center, spacing: 14) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Мой ID").font(.caption).foregroundStyle(.secondary)
                 TextField("1234", text: $m.myID)
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 90)
                     .font(.system(.body, design: .monospaced))
             }
-            Picker("Вход", selection: $m.inputDevice) {
-                Text("По умолчанию").tag(AudioDeviceID(0))
-                ForEach(m.inputDevices) { Text($0.name).tag($0.id) }
-            }
-            .frame(maxWidth: 240)
-            Picker("Выход", selection: $m.outputDevice) {
-                Text("По умолчанию").tag(AudioDeviceID(0))
-                ForEach(m.outputDevices) { Text($0.name).tag($0.id) }
-            }
-            .frame(maxWidth: 240)
-            Button { m.refreshDevices() } label: { Image(systemName: "arrow.clockwise") }
-                .help("Обновить список устройств")
-            Spacer()
-            Button { m.toggleListen() } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: m.listening ? "speaker.wave.2.fill" : "speaker.slash")
-                        .foregroundStyle(m.listening ? Color.green : Color.secondary)
-                    Text(m.listenManual ? "Слушаю" : "Слушать")
+            Grid(alignment: .leading, horizontalSpacing: 6, verticalSpacing: 6) {
+                GridRow {
+                    Text("Вход").foregroundStyle(.secondary).gridColumnAlignment(.trailing)
+                    Picker("", selection: $m.inputDevice) {
+                        Text("По умолчанию").tag(AudioDeviceID(0))
+                        ForEach(m.inputDevices) { Text($0.name).tag($0.id) }
+                    }
+                    .labelsHidden()
+                    .frame(minWidth: 160, maxWidth: 300)
+                    Button { m.refreshDevices() } label: { Image(systemName: "arrow.clockwise") }
+                        .help("Обновить список устройств")
+                }
+                GridRow {
+                    Text("Выход").foregroundStyle(.secondary)
+                    Picker("", selection: $m.outputDevice) {
+                        Text("По умолчанию").tag(AudioDeviceID(0))
+                        ForEach(m.outputDevices) { Text($0.name).tag($0.id) }
+                    }
+                    .labelsHidden()
+                    .frame(minWidth: 160, maxWidth: 300)
+                    Color.clear.frame(width: 1, height: 1)
                 }
             }
-            .help("Прослушивание эфира на устройствах самоконтроля: включить / выключить вручную. "
-                  + "После вызова на ваш ID включается само на заданное время.")
-            Button { m.extToggle() } label: {
-                HStack(spacing: 4) {
-                    Circle().fill(m.extOn ? Color.orange : Color.secondary.opacity(0.3)).frame(width: 10, height: 10)
-                    Text(m.extManual ? "Внешн. ВКЛ" : "Внешн.")
+            .layoutPriority(1)
+            Spacer(minLength: 8)
+            VStack(alignment: .trailing, spacing: 6) {
+                HStack(spacing: 8) {
+                    LevelMeter(level: m.level)
+                    if m.receiving && m.inputChannels > 1 {
+                        Text("кан. \(m.activeChannel)").font(.caption).foregroundStyle(.secondary)
+                            .help("Канал входа, по которому идёт приём (настройки → Приём → Канал входа)")
+                    }
+                    Text(afcText)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 100, alignment: .trailing)
+                }
+                HStack(spacing: 8) {
+                    TxLamp(on: m.transmitting, keyed: m.pttKeyed)
+                    Button { m.toggleListen() } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: m.listening ? "speaker.wave.2.fill" : "speaker.slash")
+                                .foregroundStyle(m.listening ? Color.green : Color.secondary)
+                            Text(m.listenManual ? "Слушаю" : "Слушать")
+                        }
+                    }
+                    .help("Прослушивание эфира на устройствах самоконтроля: включить / выключить вручную. "
+                          + "После вызова на ваш ID включается само на заданное время.")
+                    Button { m.extToggle() } label: {
+                        HStack(spacing: 4) {
+                            Circle().fill(m.extOn ? Color.orange : Color.secondary.opacity(0.3))
+                                .frame(width: 10, height: 10)
+                            Text(m.extManual ? "Внешн. ВКЛ" : "Внешн.")
+                        }
+                    }
+                    .help(m.extPort.isEmpty ? "Внешнее устройство: укажите COM-порт в настройках"
+                          : "Внешнее устройство (\(m.extPort), \(m.extLine.rawValue)): включить / выключить вручную")
+                    .disabled(m.extPort.isEmpty || m.extPortConflict)
+                    Button(m.receiving ? "Стоп приём" : "Приём") { m.toggleRx() }
+                        .tint(m.receiving ? .red : .accentColor)
+                        .buttonStyle(.borderedProminent)
+                    Button { openWindow(id: "settings") } label: { Image(systemName: "gearshape") }
+                        .help("Настройки")
                 }
             }
-            .help(m.extPort.isEmpty ? "Внешнее устройство: укажите COM-порт в настройках"
-                  : "Внешнее устройство (\(m.extPort), \(m.extLine.rawValue)): включить / выключить вручную")
-            .disabled(m.extPort.isEmpty || m.extPortConflict)
-            TxLamp(on: m.transmitting, keyed: m.pttKeyed)
-            LevelMeter(level: m.level)
-            if m.receiving && m.inputChannels > 1 {
-                Text("кан. \(m.activeChannel)").font(.caption).foregroundStyle(.secondary)
-                    .help("Канал входа, по которому идёт приём (настройки → Приём → Канал входа)")
-            }
-            Text(afcText)
-                .font(.system(.caption, design: .monospaced))
-                .foregroundStyle(.secondary)
-                .frame(width: 110, alignment: .leading)
-            Button(m.receiving ? "Стоп приём" : "Приём") { m.toggleRx() }
-                .tint(m.receiving ? .red : .accentColor)
-                .buttonStyle(.borderedProminent)
-            Button { openWindow(id: "settings") } label: { Image(systemName: "gearshape") }
-                .help("Настройки")
+            .fixedSize()
         }
         .padding(10)
     }
@@ -455,7 +477,7 @@ struct SettingsView: View {
                         Spacer()
                         Stepper(String(format: "%.0f с", m.ringSeconds), value: $m.ringSeconds, in: 5...300, step: 5)
                     }
-                    Toggle("Ответ в эфир — вызывающая станция слышит, что вызов принят (как CODAN / Vertex)", isOn: $m.ringOnAir)
+                    Toggle("Ответ в эфир — вызывающая станция слышит, что вызов принят", isOn: $m.ringOnAir)
                     if m.ringOnAir {
                         HStack {
                             Picker("Сигнал ответа в эфир", selection: $m.answerStyle) {

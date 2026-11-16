@@ -11,8 +11,8 @@ enum RingStyle: String, CaseIterable, Identifiable {
     var id: String { rawValue }
     var title: String {
         switch self {
-        case .codan: return "Двухтональный (как CODAN)"
-        case .vertex: return "Трель (как Vertex)"
+        case .codan: return "Двухтональный"
+        case .vertex: return "Трель"
         case .beep: return "Короткие гудки"
         case .kalinka: return "Мелодия «Калинка»"
         }
@@ -34,7 +34,7 @@ enum Kalinka {
     ]
 }
 
-/// Звонок при вызове на свой ID — повторяющиеся сигналы, как у трансиверов CODAN / Vertex Standard.
+/// Звонок при вызове на свой ID — повторяющиеся сигналы.
 /// Играет одновременно на всех переданных устройствах (0 = системный выход).
 final class Ringer {
     private var engines: [AVAudioEngine] = []
