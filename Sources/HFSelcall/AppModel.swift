@@ -239,6 +239,11 @@ final class AppModel: ObservableObject {
     /// Включить/выключить передачу; false — PTT включить не удалось.
     @discardableResult
     private func keyPTT(_ on: Bool) -> Bool {
+        if on && pttMethod == .icom && PTTCat.parseHexAddr(icomAddr) == nil {
+            addError("PTT: неверный адрес CI-V «\(icomAddr)» — нужно 01…FD в hex")
+            pttKeyed = false
+            return false
+        }
         let err = on ? ptt.key(true) : ptt.unkeySafe()
         pttKeyed = on && err == nil
         if let e = err { addError(e) }

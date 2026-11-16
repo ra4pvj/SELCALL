@@ -643,6 +643,12 @@ class Core:
 
     def key(self, on):
         if on:
+            if self.s["ptt_method"] == "ICOM":
+                try:
+                    PTT.parse_hex_addr(self.s["ptt_icom_addr"])
+                except Exception:
+                    return "PTT: неверный адрес CI-V «%s» — нужно 01…FD в hex" % self.s["ptt_icom_addr"]
+                self.reopen_ptt()        # адрес мог измениться в настройках
             return self.ptt.key(True)
         return self.ptt.unkey_safe()
 
@@ -1434,11 +1440,17 @@ class SettingsWindow:
         ttk.Button(bf, text="↻ порты", command=lambda: self.cb_port.configure(values=self.ports())).pack(side="left")
         ttk.Button(bf, text="Тест PTT (1 с)", command=self.test_ptt).pack(side="left", padx=4)
         ttk.Checkbutton(bf, text="Инверсия RTS/DTR", variable=v["ptt_invert"]).pack(side="left", padx=4)
-        ttk.Label(f, text="ICOM: модель / адрес CI-V").grid(row=3, column=0, **pad)
+        ttk.Label(f, text="ICOM: модель").grid(row=3, column=0, **pad)
         cm = ttk.Combobox(f, textvariable=v["icom_model"], values=list(PTT.ICOM_MODELS), state="readonly", width=16)
-        cm.grid(row=3, column=1, columnspan=2, **pad)
+        cm.grid(row=3, column=1, **pad)
         cm.bind("<<ComboboxSelected>>", lambda ev: self.on_icom())
-        ttk.Entry(f, textvariable=v["icom_addr"], width=6).grid(row=3, column=3, **pad)
+        ttk.Label(f, text="CI-V адрес (hex)").grid(row=3, column=2, **pad)
+        ttk.Entry(f, textvariable=v["icom_addr"], width=6, font=self.app.font_mono).grid(row=3, column=3, **pad)
+        self.civ_info = ttk.Label(f, text="", foreground="#666")
+        self.civ_info.grid(row=8, column=0, columnspan=4, **pad)
+        v["icom_addr"].trace_add("write", lambda *a: self.show_civ())
+        v["icom_model"].trace_add("write", lambda *a: self.show_civ())
+        self.show_civ()
         ttk.Label(f, text="KENWOOD: команда TX").grid(row=4, column=0, **pad)
         ttk.Combobox(f, textvariable=v["kenwood"], values=PTT.KENWOOD_VARIANTS, state="readonly", width=6).grid(
             row=4, column=1, **pad)
@@ -1557,6 +1569,20 @@ class SettingsWindow:
     def on_method(self):
         m = next((k for k, t in PTT_TITLES.items() if t == self.v["ptt_method"].get()), "none")
         self.v["ptt_baud"].set(str(PTT.DEFAULT_BAUD.get(m, 9600)))
+
+    def show_civ(self):
+        """подсказка: как программа поняла адрес CI-V и какая команда уйдёт в трансивер"""
+        try:
+            a = PTT.parse_hex_addr(self.v["icom_addr"].get())
+        except Exception:
+            self.civ_info.configure(text="Неверный адрес CI-V: нужно 01…FD в hex (94, A4, 0x98). Передача ICOM "
+                                         "не включится.", foreground="#c00")
+            return
+        cmd = " ".join("%02X" % b for b in PTT.command_bytes("ICOM", True, a))
+        d = PTT.ICOM_MODELS.get(self.v["icom_model"].get())
+        own = " (свой, не по умолчанию для модели)" if d is not None and d != a else ""
+        self.civ_info.configure(text="ICOM: адрес %02Xh%s, команда TX: %s — должен совпадать с CI-V Address "
+                                     "в меню трансивера" % (a, own, cmd), foreground="#666")
 
     def on_icom(self):
         a = PTT.ICOM_MODELS.get(self.v["icom_model"].get())

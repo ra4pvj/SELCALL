@@ -356,16 +356,35 @@ struct SettingsView: View {
                         if m.pttMethod.isLine {
                             Toggle("Инверсия линии", isOn: $m.pttInvert)
                         }
+                        // ICOM: модель и CI-V адрес — всегда на виду, как в HF Pager
+                        Picker("ICOM: модель", selection: $m.icomModel) {
+                            ForEach(PTTCat.icomModels, id: \.name) { Text($0.name).tag($0.name) }
+                        }
+                        .disabled(m.pttMethod != .icom)
+                        HStack {
+                            Text("ICOM: CI-V адрес (hex)")
+                            Spacer()
+                            TextField("94", text: $m.icomAddr)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(width: 70)
+                                .font(.system(.body, design: .monospaced))
+                        }
+                        .disabled(m.pttMethod != .icom)
                         if m.pttMethod == .icom {
-                            HStack {
-                                Picker("Модель ICOM", selection: $m.icomModel) {
-                                    ForEach(PTTCat.icomModels, id: \.name) { Text($0.name).tag($0.name) }
-                                }
-                                Text("CI-V")
-                                TextField("94", text: $m.icomAddr)
-                                    .frame(width: 50)
-                                    .font(.system(.body, design: .monospaced))
+                            if let a = PTTCat.parseHexAddr(m.icomAddr) {
+                                let cmd = (PTTCat.command(.icom, on: true, icomAddr: a) ?? [])
+                                    .map { String(format: "%02X", $0) }.joined(separator: " ")
+                                let def = PTTCat.icomModels.first(where: { $0.name == m.icomModel })?.addr
+                                Text(String(format: "Адрес %02Xh%@. Команда TX: %@", a,
+                                            (def != nil && def != a) ? " (свой, не по умолчанию для модели)" : "", cmd))
+                                    .font(.caption).foregroundStyle(.secondary)
+                            } else {
+                                Text("Неверный адрес CI-V: нужно 01…FD в hex (например 94, A4, 0x98). "
+                                     + "Передача не включится.")
+                                    .font(.caption).foregroundStyle(.red)
                             }
+                            Text("Адрес должен совпадать с «CI-V Address» в меню трансивера.")
+                                .font(.caption).foregroundStyle(.secondary)
                         }
                         if m.pttMethod == .kenwood || m.pttMethod == .elecraft {
                             Picker("Команда TX", selection: $m.kenwoodVariant) {
