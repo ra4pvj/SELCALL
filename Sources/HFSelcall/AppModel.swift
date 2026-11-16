@@ -58,6 +58,11 @@ final class AppModel: ObservableObject {
     @Published var extInvert: Bool { didSet { defaults.set(extInvert, forKey: "extInvert"); extReset() } }
     @Published var extSeconds: Double { didSet { defaults.set(extSeconds, forKey: "extSeconds") } }
     @Published var extOn = false            // выход сейчас включён
+    // прослушивание эфира после вызова (чтобы услышать голосовое сообщение)
+    @Published var listenAfterCall: Bool { didSet { defaults.set(listenAfterCall, forKey: "listenAfterCall") } }
+    @Published var listenSeconds: Double { didSet { defaults.set(listenSeconds, forKey: "listenSeconds") } }
+    @Published var listening = false        // вход сейчас слышен (по вызову или вручную)
+    @Published var listenManual = false
     @Published var extManual = false        // включён вручную (без таймера)
     /// Сигнал ответа в эфир — выбирается отдельно от звонка.
     @Published var answerStyle: RingStyle { didSet { defaults.set(answerStyle.rawValue, forKey: "answerStyle") } }
@@ -112,6 +117,8 @@ final class AppModel: ObservableObject {
     private let monitor = Monitor()
     private let ext = ExtControl()
     private var extTimer: DispatchWorkItem?
+    private var listenTimer: DispatchWorkItem?
+    private var listenPending = false       // включить прослушивание после окончания ответа в эфир
     private var watchdog: DispatchWorkItem?
 
     init() {
@@ -143,6 +150,8 @@ final class AppModel: ObservableObject {
         extLine = ExtLine(rawValue: defaults.string(forKey: "extLine") ?? "") ?? .dtr
         extInvert = defaults.bool(forKey: "extInvert")
         extSeconds = defaults.object(forKey: "extSeconds") as? Double ?? 5
+        listenAfterCall = defaults.object(forKey: "listenAfterCall") as? Bool ?? true
+        listenSeconds = defaults.object(forKey: "listenSeconds") as? Double ?? 60
         ringVolume = defaults.object(forKey: "ringVolume") as? Double ?? 0.5
         ringSeconds = defaults.object(forKey: "ringSeconds") as? Double ?? 30
         ringOnAir = defaults.object(forKey: "ringOnAir") as? Bool ?? true
@@ -195,7 +204,8 @@ final class AppModel: ObservableObject {
     }
 
     private func applyMonitor() {
-        let ids = (monitorRX || monitorTX) ? monitorDeviceIDs : []
+        var ids = (monitorRX || monitorTX || listening) ? monitorDeviceIDs : []
+        if listening && ids.isEmpty { ids = [AudioDeviceID(0)] }     // нет устройств — системный выход
         var names = [AudioDeviceID: String]()
         for d in outputDevices { names[d.id] = d.name }
         monitor.configure(devices: ids, names: names)
@@ -292,6 +302,45 @@ final class AppModel: ObservableObject {
         extOn = false
     }
 
+    // MARK: прослушивание эфира после вызова
+
+    /// Открыть вход на `seconds` секунд (по вызову). Ручное включение таймером не перебивается.
+    func startListen(_ seconds: Double? = nil) {
+        guard !listenManual else { return }
+        ringer.stop()                      // звонок отработал — дальше слушаем вызывающего
+        if !receiving { addError("Прослушивание: приём выключен — нажмите «Приём»") }
+        setListening(true)
+        listenTimer?.cancel()
+        let w = DispatchWorkItem { [weak self] in
+            guard let self = self, !self.listenManual else { return }
+            self.setListening(false)
+        }
+        listenTimer = w
+        let sec = min(600, max(5, seconds ?? listenSeconds))
+        addInfo(String(format: "Прослушивание эфира включено на %.0f с", sec))
+        DispatchQueue.main.asyncAfter(deadline: .now() + sec, execute: w)
+    }
+
+    /// Кнопка «Слушать» на панели: включить / выключить вручную.
+    func toggleListen() {
+        listenTimer?.cancel()
+        listenPending = false
+        if listening {
+            listenManual = false
+            setListening(false)
+        } else {
+            ringer.stop()
+            listenManual = true
+            setListening(true)
+        }
+    }
+
+    private func setListening(_ on: Bool) {
+        guard listening != on else { return }
+        listening = on
+        applyMonitor()
+    }
+
     // MARK: звонок
 
     func stopRing() {
@@ -357,7 +406,7 @@ final class AppModel: ObservableObject {
         dsp.async {
             self.receiver.append(y)
         }
-        if monitorRX { monitor.feedRX(y) }
+        if monitorRX || listening { monitor.feedRX(y) }
         let ch = audio.activeChannel, nch = audio.inputChannels
         DispatchQueue.main.async {
             // пиковый индикатор: мгновенный подъём, плавный спад
@@ -410,6 +459,10 @@ final class AppModel: ObservableObject {
                 ringer.start(style: ringStyle, devices: monitorDeviceIDs, volume: ringVolume, seconds: ringSeconds)
             }
             if extEnabled && !extPort.isEmpty { extPulse() }
+            if listenAfterCall {
+                // после ответа в эфир (если он включён) — сразу открыть вход
+                if ringOnAir { listenPending = true } else { startListen() }
+            }
             if ringOnAir {
                 // небольшая пауза: вызывающая станция успевает перейти на приём
                 let from = c.from
@@ -522,6 +575,11 @@ final class AppModel: ObservableObject {
         watchdog?.cancel()
         watchdog = nil
         keyPTT(false)
+        if listenPending {
+            listenPending = false
+            // вход размьютится через 0,5 с после передачи — тогда и слушаем
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.startListen() }
+        }
         transmitting = false
         if muteRxOnTx { muteUntil = Date().addingTimeInterval(0.5) }
     }

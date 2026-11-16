@@ -85,6 +85,15 @@ struct ContentView: View {
             Button { m.refreshDevices() } label: { Image(systemName: "arrow.clockwise") }
                 .help("Обновить список устройств")
             Spacer()
+            Button { m.toggleListen() } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: m.listening ? "speaker.wave.2.fill" : "speaker.slash")
+                        .foregroundStyle(m.listening ? Color.green : Color.secondary)
+                    Text(m.listenManual ? "Слушаю" : "Слушать")
+                }
+            }
+            .help("Прослушивание эфира на устройствах самоконтроля: включить / выключить вручную. "
+                  + "После вызова на ваш ID включается само на заданное время.")
             Button { m.extToggle() } label: {
                 HStack(spacing: 4) {
                     Circle().fill(m.extOn ? Color.orange : Color.secondary.opacity(0.3)).frame(width: 10, height: 10)
@@ -394,6 +403,22 @@ struct SettingsView: View {
                              + "на панели включает выход вручную, пока не нажмёте её снова.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                }
+                Section("Прослушивание эфира после вызова") {
+                    Toggle("Включать после вызова на мой ID (чтобы услышать голосовое сообщение)",
+                           isOn: $m.listenAfterCall)
+                    HStack {
+                        Text("Время прослушивания")
+                        Slider(value: $m.listenSeconds, in: 5...600, step: 5)
+                        Text(m.listenSeconds >= 60 ? String(format: "%d:%02d", Int(m.listenSeconds) / 60,
+                                                            Int(m.listenSeconds) % 60)
+                                                   : String(format: "%.0f с", m.listenSeconds))
+                            .monospacedDigit().frame(width: 50)
+                    }
+                    Text("Вызов → ответ в эфир → вход звучит на устройствах самоконтроля (или на системном выходе) "
+                         + "заданное время, затем выключается. Уровень — «Уровень самоконтроля». "
+                         + "Кнопка «Слушать» на панели включает прослушивание вручную.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
                 Section("Самоконтроль (можно несколько устройств)") {
                     Toggle("Слушать эфир (вход)", isOn: $m.monitorRX)

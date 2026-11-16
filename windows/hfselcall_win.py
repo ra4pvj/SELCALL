@@ -79,6 +79,7 @@ DEFAULTS = dict(
     ring=True, ring_style="codan", answer_style="kalinka", ring_volume=0.5, ring_seconds=30.0,
     ring_air=True,
     ext_enabled=False, ext_port="", ext_line="DTR", ext_invert=False, ext_seconds=5.0,
+    listen_after_call=True, listen_seconds=60.0,
 )
 
 PTT_TITLES = {"none": "нет (VOX / внешний PTT)", "RTS": "RTS", "DTR": "DTR", "RTS+DTR": "RTS + DTR",
@@ -309,6 +310,8 @@ def ring_pattern(style, fs, volume):
     return np.concatenate(out).astype(np.float32)
 
 
+DEFAULT_OUT = "<системный выход>"
+
 # ============================================================================ самоконтроль
 class Monitor:
     """Самоконтроль: звук эфира и/или своей передачи одновременно на одно или несколько
@@ -332,8 +335,8 @@ class Monitor:
         for n in names:
             if n in self.outs:
                 continue
-            dev = device_index(n, "out")
-            if dev is None:
+            dev = device_index(n, "out") if n != DEFAULT_OUT else None    # DEFAULT_OUT — системный выход
+            if dev is None and n != DEFAULT_OUT:
                 self.errors.append("%s: устройство не найдено" % n)
                 continue
             for fs in (RX_FS, 48000, 44100):
@@ -487,6 +490,10 @@ class Core:
         self.ext = ExtControl()
         self.ext_manual = False
         self.ext_timer = None
+        self.listening = False
+        self.listen_manual = False
+        self.listen_timer = None
+        self.listen_pending = False
         self.tx_queue = []
         self.transmitting = False
         self.watchdog = None
@@ -591,7 +598,7 @@ class Core:
         if time.time() < self.mute_until:
             y = np.zeros_like(y)
         self.audio_q.put_nowait(y)       # аудиопоток не ждёт декодер
-        if self.s["mon_rx"]:
+        if self.s["mon_rx"] or self.listening:
             self.monitor.feed(y)
 
     def _rx_loop(self):
@@ -682,10 +689,53 @@ class Core:
         self.ext_manual = False
         self.ext.close(self.s.get("ext_line") or "RTS+DTR", bool(self.s.get("ext_invert")))
 
+    # ---- прослушивание эфира после вызова (чтобы услышать голосовое сообщение)
+    def _set_listening(self, on):
+        if self.listening == on:
+            return
+        self.listening = on
+        for e in self.apply_monitor():
+            self.q.put(("error", "Самоконтроль: %s" % e))
+
+    def start_listen(self, seconds=None):
+        """открыть вход на заданное время (5 с … 10 мин); ручное включение не перебивается"""
+        if self.listen_manual:
+            return
+        self.stop_ring()                    # звонок отработал — слушаем вызывающего
+        if not self.receiving:
+            self.q.put(("error", "Прослушивание: приём выключен — нажмите «Приём»"))
+        self._set_listening(True)
+        if self.listen_timer is not None:
+            self.listen_timer.cancel()
+        sec = min(600.0, max(5.0, float(seconds or self.s.get("listen_seconds") or 60)))
+        self.q.put(("info", "Прослушивание эфира включено на %.0f с" % sec))
+
+        def off():
+            if not self.listen_manual:
+                self.q.put(("listen_off",))
+        self.listen_timer = threading.Timer(sec, off)
+        self.listen_timer.daemon = True
+        self.listen_timer.start()
+
+    def toggle_listen(self):
+        if self.listen_timer is not None:
+            self.listen_timer.cancel()
+            self.listen_timer = None
+        self.listen_pending = False
+        if self.listening:
+            self.listen_manual = False
+            self._set_listening(False)
+        else:
+            self.stop_ring()
+            self.listen_manual = True
+            self._set_listening(True)
+
     # ---- самоконтроль
     def apply_monitor(self):
         devs = list(self.s.get("mon_devs") or [])
-        active = devs if (self.s["mon_rx"] or self.s["mon_tx"]) else []
+        active = devs if (self.s["mon_rx"] or self.s["mon_tx"] or self.listening) else []
+        if self.listening and not active:
+            active = [DEFAULT_OUT]          # нет устройств самоконтроля — системный выход
         self.monitor.configure(active, self.s["mon_level"])
         return self.monitor.errors
 
@@ -773,6 +823,11 @@ class Core:
         if self.watchdog is not None:
             self.watchdog.cancel()
             self.watchdog = None
+        if getattr(self, "listen_pending", False):
+            self.listen_pending = False
+            t = threading.Timer(0.5, lambda: self.q.put(("listen_start",)))   # после размьючивания входа
+            t.daemon = True
+            t.start()
         self.key(False)
         self.transmitting = False
         if self.s["mute_rx_on_tx"]:
@@ -936,6 +991,12 @@ class App:
             self.meter.create_line(x, 0, x, 12, fill="#777")
         self.ch_lbl = ttk.Label(top, text="", width=6)
         self.ch_lbl.pack(side="right")
+        self.btn_listen = ttk.Button(top, text="Слушать", width=9, command=self.core.toggle_listen)
+        self.btn_listen.pack(side="right", padx=2)
+        ls_c = tk.Canvas(top, width=14, height=14, highlightthickness=0)
+        ls_c.pack(side="right")
+        self.listen_lamp = ls_c.create_oval(2, 2, 12, 12, fill="#bbb", outline="")
+        self.listen_canvas = ls_c
         self.btn_ext = ttk.Button(top, text="Внешн.", width=11, command=self.ext_toggle)
         self.btn_ext.pack(side="right", padx=2)
         ext_c = tk.Canvas(top, width=14, height=14, highlightthickness=0)
@@ -1104,6 +1165,11 @@ class App:
             self.core.ring()
         if self.core.s.get("ext_enabled") and self.core.s.get("ext_port"):
             self.core.ext_pulse()
+        if self.core.s.get("listen_after_call", True):
+            if self.core.s.get("ring_air"):
+                self.core.listen_pending = True      # после ответа в эфир
+            else:
+                self.core.start_listen()
         if self.core.s.get("ring_air"):
             # небольшая пауза: вызывающая станция успевает перейти на приём
             frm = c["from"]
@@ -1202,6 +1268,11 @@ class App:
                     self.core.tx_done()
                 elif k == "stop_tx":
                     self.core.stop_tx()
+                elif k == "listen_start":
+                    self.core.start_listen()
+                elif k == "listen_off":
+                    if not self.core.listen_manual:
+                        self.core._set_listening(False)
                 elif k == "info":
                     self.add(ev[1], "info")
                 elif k == "error":
@@ -1230,6 +1301,8 @@ class App:
         self.meter.tag_lower(self.meter_bar)
         self.db_lbl.configure(text=("%5.1f дБ" % db) if db > -60 else "  —  дБ")
         self.ext_canvas.itemconfigure(self.ext_lamp, fill="#f80" if self.core.ext.on else "#bbb")
+        self.listen_canvas.itemconfigure(self.listen_lamp, fill="#2b2" if self.core.listening else "#bbb")
+        self.btn_listen.configure(text="Слушаю" if self.core.listen_manual else "Слушать")
         self.btn_ext.configure(text="Внешн. ВКЛ" if self.core.ext_manual else "Внешн.")
         on = self.core.transmitting or self.core.ptt.keyed
         self.lamp_canvas.itemconfigure(self.lamp, fill="#e00" if on else "#bbb")
@@ -1280,6 +1353,8 @@ class SettingsWindow:
             ext_line=tk.StringVar(value=s.get("ext_line", "DTR")),
             ext_invert=tk.BooleanVar(value=s.get("ext_invert", False)),
             ext_sec=tk.DoubleVar(value=s.get("ext_seconds", 5.0)),
+            listen=tk.BooleanVar(value=s.get("listen_after_call", True)),
+            listen_sec=tk.DoubleVar(value=s.get("listen_seconds", 60.0)),
         )
         v = self.v
 
@@ -1395,8 +1470,19 @@ class SettingsWindow:
         ttk.Label(f, text="Кнопка «Внешн.» на панели включает выход вручную, пока не нажмёте её снова.",
                   foreground="#666").grid(row=3, column=0, columnspan=5, **pad)
 
+        f = ttk.LabelFrame(w, text="Прослушивание эфира после вызова (чтобы услышать голосовое сообщение)",
+                           padding=6)
+        f.grid(row=5, column=0, columnspan=2, sticky="ew", padx=10, pady=4)
+        ttk.Checkbutton(f, text="Включать после вызова на мой ID: вызов → ответ в эфир → вход звучит на устройствах "
+                                "самоконтроля (или системном выходе)", variable=v["listen"]).grid(
+            row=0, column=0, columnspan=3, **pad)
+        ttk.Label(f, text="Время прослушивания, с (5–600)").grid(row=1, column=0, **pad)
+        ttk.Spinbox(f, from_=5, to=600, increment=5, textvariable=v["listen_sec"], width=6).grid(
+            row=1, column=1, **pad)
+        ttk.Label(f, text="Кнопка «Слушать» на панели — вручную.", foreground="#666").grid(row=1, column=2, **pad)
+
         b = ttk.Frame(w, padding=(10, 8))
-        b.grid(row=5, column=0, columnspan=2, sticky="ew")
+        b.grid(row=6, column=0, columnspan=2, sticky="ew")
         ttk.Button(b, text="Очистить журнал", command=self.clear_log).pack(side="left")
         ttk.Button(b, text="Готово", command=self.close).pack(side="right")
         w.protocol("WM_DELETE_WINDOW", self.close)
@@ -1467,6 +1553,8 @@ class SettingsWindow:
         s["ext_line"] = v["ext_line"].get() if v["ext_line"].get() in EXT_LINES else "DTR"
         s["ext_invert"] = bool(v["ext_invert"].get())
         s["ext_seconds"] = self._num(v["ext_sec"], 1, 60, 5)
+        s["listen_after_call"] = bool(v["listen"].get())
+        s["listen_seconds"] = self._num(v["listen_sec"], 5, 600, 60)
         if old != (s["ext_port"], s["ext_line"], s["ext_invert"]):
             self.app.core.ext.close(old[1] or "RTS+DTR", bool(old[2]))
             self.app.core.ext_manual = False
@@ -1579,6 +1667,19 @@ def selftest(out_path):
     c3.s["ext_port"] = "COM4"
     good = good and not c3.ext_conflict()
     log("external device: separate port enforced: %s" % ("OK" if good else "FAIL"))
+    ok = ok and good
+    c4 = Core.__new__(Core)
+    c4.s = dict(DEFAULTS, mon_devs=[], mon_rx=False, mon_tx=False)
+    c4.q = queue.Queue()
+    c4.monitor = Monitor()
+    c4.ring_timer, c4.ring_players = None, []
+    c4.receiving, c4.listening, c4.listen_manual, c4.listen_timer, c4.listen_pending = True, False, False, None, False
+    c4.start_listen(5)
+    good = c4.listening and c4.listen_timer is not None
+    c4.listen_timer.cancel()
+    c4.toggle_listen()
+    good = good and not c4.listening
+    log("listen after call (timer + manual toggle): %s" % ("OK" if good else "FAIL"))
     ok = ok and good
     k = ring_pattern("kalinka", 8000, 0.5)
     melody = (len(k) / 8000.0) - 0.8
