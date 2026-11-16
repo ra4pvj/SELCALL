@@ -99,9 +99,15 @@ final class AudioIO {
 
     /// Вызывается с аудиопотока: моно-отсчёты 8 кГц и пиковый уровень выбранного канала (0…1).
     var onSamples: (([Float], Float) -> Void)?
-    /// macOS перестроил звуковое устройство и остановил движок приёма — нужно перезапустить приём.
-    var onRxConfigurationChange: (() -> Void)?
-    private var rxConfigObserver: NSObjectProtocol?
+    /// Время последнего блока со входа (для сторожевого таймера приёма). Уведомления macOS о
+    /// «перестройке устройства» не используются: с USB-звуком (IC-705 и т.п.) они приходят
+    /// постоянно, и перезапуск по ним зацикливался.
+    private let sampleClock = NSLock()
+    private var lastSampleAt = Date()
+    var secondsSinceLastSample: TimeInterval {
+        sampleClock.lock(); defer { sampleClock.unlock() }
+        return Date().timeIntervalSince(lastSampleAt)
+    }
     /// Канал входа: 0 — авто (канал с сигналом), 1, 2, … — номер канала устройства.
     var inputChannel = 0
     /// Какой канал реально используется (1…), и сколько каналов у входа.
@@ -199,6 +205,7 @@ final class AudioIO {
             }
             guard err == nil, let ch = out.floatChannelData, out.frameLength > 0 else { return }
             let x = Array(UnsafeBufferPointer(start: ch[0], count: Int(out.frameLength)))
+            self.sampleClock.lock(); self.lastSampleAt = Date(); self.sampleClock.unlock()
             self.onSamples?(x, peak)
         }
         do {
@@ -217,15 +224,10 @@ final class AudioIO {
             try engine.start()
         }
         rxEngine = engine
-        rxConfigObserver = NotificationCenter.default.addObserver(
-            forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main) { [weak self] _ in
-            self?.onRxConfigurationChange?()
-        }
+        sampleClock.lock(); lastSampleAt = Date(); sampleClock.unlock()
     }
 
     func stopRx() {
-        if let o = rxConfigObserver { NotificationCenter.default.removeObserver(o) }
-        rxConfigObserver = nil
         if let e = rxEngine {
             _ = ObjCSafe.run {
                 e.inputNode.removeTap(onBus: 0)

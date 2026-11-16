@@ -559,6 +559,7 @@ class Core:
         self.audio_q = queue.Queue()
         self.rx.reset()
         self.rx_start = time.time()
+        self.last_audio = time.time()
         self.receiving = True
         self.rx_thread = threading.Thread(target=self._rx_loop, daemon=True)
         self.rx_thread.start()
@@ -576,6 +577,7 @@ class Core:
         self.level = 0.0
 
     def _on_audio(self, indata, frames, t, status):
+        self.last_audio = time.time()
         nch = indata.shape[1]
         want = int(self.s.get("in_channel") or 0)
         if want > 0:
@@ -612,6 +614,11 @@ class Core:
                         self.rx.append(self.audio_q.get_nowait())
                     except queue.Empty:
                         break
+                # сторожевой таймер: вход не отдаёт звук > 4 с (USB-кодек «уснул») — перезапуск, не чаще раза в 10 с
+                now = time.time()
+                if now - getattr(self, "last_audio", now) > 4 and now - getattr(self, "last_restart", 0) > 10:
+                    self.last_restart = now
+                    self.q.put(("rx_restart", now - self.last_audio))
                 self.rx.fixed_center = None if self.s["afc"] else float(self.s["fixed_center"])
                 calls = self.rx.process()
                 self.q.put(("centers", list(self.rx.last_centers)))
@@ -798,6 +805,9 @@ class Core:
             self._finish_tx()
             return
         self.q.put(("tx", me, to, text, title, dur))
+        now = time.time()
+        self.tx_history = [t for t in getattr(self, "tx_history", []) if now - t[3] < 120]
+        self.tx_history.append((to, text, now, now + dur))      # чтобы отличить эхо от вызова с того же ID
         if self.watchdog is not None:
             self.watchdog.cancel()
         self.watchdog = threading.Timer(dur + 5.0, self._watchdog_fire)
@@ -1132,7 +1142,12 @@ class App:
     def handle_rx(self, c, when, from_file):
         me = digits(self.core.s["my_id"])
         mine = c["to"] == me.zfill(len(c["to"]))
-        own = (not from_file) and c["from"] == me.zfill(len(c["from"]))
+        # вызов со своего ID — обычный вызов (так бывает в работе); эхо — только собственная передача:
+        # тот же получатель и текст, по времени совпадает с нашей передачей
+        from_me = c["from"] == me.zfill(len(c["from"]))
+        own = (not from_file) and from_me and any(
+            t[0].zfill(len(c["to"])) == c["to"] and t[1] == c["message"] and t[2] - 3 <= when <= t[3] + 3
+            for t in getattr(self.core, "tx_history", []))
         if not self.core.s["show_all"] and not mine and not from_file:
             return
         if c["eos"] == "ACK-BQ":
@@ -1280,6 +1295,13 @@ class App:
                     self.core.tx_done()
                 elif k == "stop_tx":
                     self.core.stop_tx()
+                elif k == "rx_restart":
+                    if self.core.receiving:
+                        try:
+                            self.core.start_rx()
+                            self.add("Вход не отдаёт звук %.0f с — приём перезапущен" % ev[1], "info")
+                        except Exception as ex:
+                            self.add("Не удалось перезапустить приём: %s" % ex, "error")
                 elif k == "listen_start":
                     self.core.start_listen()
                 elif k == "listen_off":

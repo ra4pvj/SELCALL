@@ -112,6 +112,8 @@ final class AppModel: ObservableObject {
     private var txReady = false
     private var muteUntil = Date.distantPast         // не декодировать собственную передачу
     private var txQueue: [(samples: [Float], entry: LogEntry)] = []
+    /// Недавние собственные передачи — чтобы отличить эхо своего сигнала от вызова с того же ID.
+    private var txHistory: [(to: String, text: String, start: Date, end: Date)] = []
     private let ptt = PTTController()
     private let ringer = Ringer()
     private let monitor = Monitor()
@@ -165,11 +167,6 @@ final class AppModel: ObservableObject {
         refreshDevices()
         audio.inputChannel = inputChannel
         audio.onSamples = { [weak self] x, peak in self?.onSamples(x, peak) }
-        audio.onRxConfigurationChange = { [weak self] in
-            guard let self = self, self.receiving else { return }
-            self.addInfo("Звуковое устройство перестроено — приём перезапущен")
-            self.restartRxKeepingState()
-        }
         reopenPTT()
         monitor.level = Float(monitorLevel)
         applyMonitor()
@@ -392,7 +389,17 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Перезапуск движка приёма без сброса декодера (после перестройки устройства macOS).
+    private var lastRxRestart = Date.distantPast
+
+    /// Сторожевой таймер приёма: вход не отдаёт звук дольше 4 с — перезапуск (не чаще раза в 10 с).
+    private func rxWatchdog(_ silent: TimeInterval) {
+        guard receiving, silent > 4, Date().timeIntervalSince(lastRxRestart) > 10 else { return }
+        lastRxRestart = Date()
+        addInfo(String(format: "Вход не отдаёт звук %.0f с — приём перезапущен", silent))
+        restartRxKeepingState()
+    }
+
+    /// Перезапуск движка приёма без сброса декодера.
     private func restartRxKeepingState() {
         do {
             if let warn = try audio.startRx(device: inputDevice) { addError(warn) }
@@ -440,9 +447,11 @@ final class AppModel: ObservableObject {
             let calls = self.receiver.process()
             let centers = self.receiver.lastCenters
             let start = self.rxStart
+            let silent = self.audio.secondsSinceLastSample
             DispatchQueue.main.async {
                 self.centers = centers
                 for c in calls { self.handleRx(c, date: start.addingTimeInterval(c.time)) }
+                self.rxWatchdog(silent)
             }
         }
         t.resume()
@@ -451,7 +460,13 @@ final class AppModel: ObservableObject {
 
     private func handleRx(_ c: DecodedCall, date: Date, fromFile: Bool = false) {
         let mine = Selcall.digitsOnly(c.to) == Selcall.digitsOnly(myID).leftPadded(to: c.to.count)
-        let own = !fromFile && Selcall.digitsOnly(c.from) == Selcall.digitsOnly(myID).leftPadded(to: c.from.count)
+        // Вызов со своего ID — обычный вызов (так бывает в работе). Эхом считается только собственная
+        // передача: тот же получатель и текст, по времени совпадает с нашей передачей.
+        let fromMe = Selcall.digitsOnly(c.from) == Selcall.digitsOnly(myID).leftPadded(to: c.from.count)
+        let own = !fromFile && fromMe && txHistory.contains { tx in
+            Selcall.digitsOnly(tx.to).leftPadded(to: c.to.count) == c.to && tx.text == c.message
+                && date >= tx.start.addingTimeInterval(-3) && date <= tx.end.addingTimeInterval(3)
+        }
         if !showAll && !mine && !fromFile { return }
         let title: String
         switch (c.isMessage, c.eos) {
@@ -560,6 +575,9 @@ final class AppModel: ObservableObject {
         let item = txQueue.removeFirst()
         transmitting = true
         log.append(item.entry)
+        txHistory.append((to: item.entry.to, text: item.entry.text, start: Date(),
+                          end: Date().addingTimeInterval(Double(item.samples.count) / audio.outputRate)))
+        txHistory.removeAll { Date().timeIntervalSince($0.end) > 120 }
         let dur = Double(item.samples.count) / audio.outputRate
         if muteRxOnTx { muteUntil = Date().addingTimeInterval(dur + 1.0) }
         guard keyPTT(true) else {
