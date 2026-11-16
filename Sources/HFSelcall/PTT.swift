@@ -223,3 +223,77 @@ final class PTTController {
 
     deinit { close() }
 }
+
+// MARK: - Внешнее устройство (сирена, лампа, реле) — «1» на линии COM-порта при вызове
+
+enum ExtLine: String, CaseIterable, Identifiable {
+    case rts = "RTS", dtr = "DTR", both = "RTS+DTR"
+    var id: String { rawValue }
+    var bits: Int32 {
+        switch self {
+        case .rts: return 0x004
+        case .dtr: return 0x002
+        case .both: return 0x006
+        }
+    }
+}
+
+/// Управление внешним устройством линией RTS/DTR последовательного порта.
+/// На macOS порт можно открыть и параллельно с PTT (тот же порт, другая линия).
+final class ExtControl {
+    private static let tiocmbis: UInt = 0x8004_746C
+    private static let tiocmbic: UInt = 0x8004_746B
+    private var fd: Int32 = -1
+    private(set) var port = ""
+    private(set) var isOn = false
+    private let lock = NSLock()
+
+    private func openLocked(_ p: String) throws {
+        if fd >= 0 && p == port { return }
+        if fd >= 0 { Darwin.close(fd) }
+        fd = -1
+        guard !p.isEmpty else { throw PTTError.noPort }
+        let f = Darwin.open(p, O_RDWR | O_NOCTTY | O_NONBLOCK)
+        guard f >= 0 else { throw PTTError.open(p, errno) }
+        var t = termios()
+        if tcgetattr(f, &t) == 0 {
+            t.c_cflag |= tcflag_t(CLOCAL)
+            t.c_cflag &= ~tcflag_t(HUPCL)
+            _ = tcsetattr(f, TCSANOW, &t)
+        }
+        fd = f
+        port = p
+    }
+
+    private func setLines(_ bits: Int32, _ high: Bool) throws {
+        var b = bits
+        let r = withUnsafeMutablePointer(to: &b) { ioctl(fd, high ? Self.tiocmbis : Self.tiocmbic, $0) }
+        if r != 0 { throw PTTError.io("линия порта", errno) }
+    }
+
+    /// Включить/выключить выход. nil — успех, иначе текст ошибки.
+    @discardableResult
+    func set(_ on: Bool, port p: String, line: ExtLine, invert: Bool) -> String? {
+        lock.lock(); defer { lock.unlock() }
+        do {
+            try openLocked(p)
+            try setLines(line.bits, on != invert)
+            isOn = on
+            return nil
+        } catch {
+            return "Внешнее устройство: \(error.localizedDescription)"
+        }
+    }
+
+    /// Привести линию в исходное состояние (выключено) и закрыть порт.
+    func close(line: ExtLine, invert: Bool) {
+        lock.lock(); defer { lock.unlock() }
+        if fd >= 0 {
+            _ = try? setLines(line.bits, invert)
+            Darwin.close(fd)
+        }
+        fd = -1
+        port = ""
+        isOn = false
+    }
+}

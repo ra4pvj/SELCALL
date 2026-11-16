@@ -51,6 +51,14 @@ final class AppModel: ObservableObject {
     // звонок
     @Published var ringEnabled: Bool { didSet { defaults.set(ringEnabled, forKey: "ringEnabled") } }
     @Published var ringStyle: RingStyle { didSet { defaults.set(ringStyle.rawValue, forKey: "ringStyle") } }
+    // внешнее устройство: «1» на линии COM-порта при вызове на мой ID
+    @Published var extEnabled: Bool { didSet { defaults.set(extEnabled, forKey: "extEnabled") } }
+    @Published var extPort: String { didSet { defaults.set(extPort, forKey: "extPort"); extReset() } }
+    @Published var extLine: ExtLine { didSet { defaults.set(extLine.rawValue, forKey: "extLine"); extReset() } }
+    @Published var extInvert: Bool { didSet { defaults.set(extInvert, forKey: "extInvert"); extReset() } }
+    @Published var extSeconds: Double { didSet { defaults.set(extSeconds, forKey: "extSeconds") } }
+    @Published var extOn = false            // выход сейчас включён
+    @Published var extManual = false        // включён вручную (без таймера)
     /// Сигнал ответа в эфир — выбирается отдельно от звонка.
     @Published var answerStyle: RingStyle { didSet { defaults.set(answerStyle.rawValue, forKey: "answerStyle") } }
     // самоконтроль: эфир и своя передача на одно или несколько устройств
@@ -102,6 +110,8 @@ final class AppModel: ObservableObject {
     private let ptt = PTTController()
     private let ringer = Ringer()
     private let monitor = Monitor()
+    private let ext = ExtControl()
+    private var extTimer: DispatchWorkItem?
     private var watchdog: DispatchWorkItem?
 
     init() {
@@ -128,6 +138,11 @@ final class AppModel: ObservableObject {
         ringEnabled = defaults.object(forKey: "ringEnabled") as? Bool ?? true
         ringStyle = RingStyle(rawValue: defaults.string(forKey: "ringStyle") ?? "") ?? .codan
         answerStyle = RingStyle(rawValue: defaults.string(forKey: "answerStyle") ?? "") ?? .kalinka
+        extEnabled = defaults.bool(forKey: "extEnabled")
+        extPort = defaults.string(forKey: "extPort") ?? ""
+        extLine = ExtLine(rawValue: defaults.string(forKey: "extLine") ?? "") ?? .dtr
+        extInvert = defaults.bool(forKey: "extInvert")
+        extSeconds = defaults.object(forKey: "extSeconds") as? Double ?? 5
         ringVolume = defaults.object(forKey: "ringVolume") as? Double ?? 0.5
         ringSeconds = defaults.object(forKey: "ringSeconds") as? Double ?? 30
         ringOnAir = defaults.object(forKey: "ringOnAir") as? Bool ?? true
@@ -148,6 +163,7 @@ final class AppModel: ObservableObject {
                                                object: nil, queue: .main) { [weak self] _ in
             self?.ptt.unkeySafe()
             self?.ptt.close()
+            if let m = self { m.ext.close(line: m.extLine, invert: m.extInvert) }
             self?.ringer.stop()
             self?.monitor.close()
         }
@@ -222,6 +238,58 @@ final class AppModel: ObservableObject {
             guard let self = self, !self.transmitting else { return }
             self.keyPTT(false)
         }
+    }
+
+    // MARK: внешнее устройство
+
+    /// Включить выход на `seconds` секунд (1…60). Ручное включение таймером не перебивается.
+    func extPulse(_ seconds: Double? = nil) {
+        guard !extManual else { return }
+        guard extSet(true) else { return }
+        extTimer?.cancel()
+        let w = DispatchWorkItem { [weak self] in
+            guard let self = self, !self.extManual else { return }
+            self.extSet(false)
+        }
+        extTimer = w
+        let sec = min(60, max(1, seconds ?? extSeconds))
+        DispatchQueue.main.asyncAfter(deadline: .now() + sec, execute: w)
+    }
+
+    /// Кнопка на панели: принудительно включить / выключить выход.
+    func extToggle() {
+        extTimer?.cancel()
+        if extOn {
+            extManual = false
+            extSet(false)
+        } else if extSet(true) {
+            extManual = true
+        }
+    }
+
+    /// Порт внешнего устройства совпадает с портом PTT/CAT — так нельзя.
+    var extPortConflict: Bool { !extPort.isEmpty && pttMethod.usesPort && extPort == pttPort }
+
+    @discardableResult
+    private func extSet(_ on: Bool) -> Bool {
+        if on && extPortConflict {
+            addError("Внешнее устройство: порт \(extPort) занят PTT/CAT — выберите другой COM-порт")
+            return false
+        }
+        if let e = ext.set(on, port: extPort, line: extLine, invert: extInvert) {
+            addError(e)
+            extOn = false
+            return false
+        }
+        extOn = on
+        return true
+    }
+
+    private func extReset() {
+        extTimer?.cancel()
+        extManual = false
+        if extOn { ext.close(line: extLine, invert: extInvert) }
+        extOn = false
     }
 
     // MARK: звонок
@@ -341,6 +409,7 @@ final class AppModel: ObservableObject {
             if ringEnabled {
                 ringer.start(style: ringStyle, devices: monitorDeviceIDs, volume: ringVolume, seconds: ringSeconds)
             }
+            if extEnabled && !extPort.isEmpty { extPulse() }
             if ringOnAir {
                 // небольшая пауза: вызывающая станция успевает перейти на приём
                 let from = c.from

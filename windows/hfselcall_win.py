@@ -78,6 +78,7 @@ DEFAULTS = dict(
     mon_devs=[], mon_rx=True, mon_tx=True, mon_level=0.5,
     ring=True, ring_style="codan", answer_style="kalinka", ring_volume=0.5, ring_seconds=30.0,
     ring_air=True,
+    ext_enabled=False, ext_port="", ext_line="DTR", ext_invert=False, ext_seconds=5.0,
 )
 
 PTT_TITLES = {"none": "нет (VOX / внешний PTT)", "RTS": "RTS", "DTR": "DTR", "RTS+DTR": "RTS + DTR",
@@ -396,6 +397,68 @@ def to_8k(x, fs):
     return np.interp(np.arange(n) * fs / RX_FS, np.arange(len(x)), x).astype(np.float32)
 
 
+# ============================================================================ внешнее устройство
+EXT_LINES = ["RTS", "DTR", "RTS+DTR"]
+
+
+class ExtControl:
+    """Внешнее устройство (сирена, лампа, реле): «1» на линии RTS/DTR отдельного COM-порта."""
+
+    def __init__(self):
+        self.ser = None
+        self.port = ""
+        self.on = False
+        self.lock = threading.Lock()
+
+    def _open(self, port, line, invert):
+        if self.ser is not None and self.port == port:
+            return
+        self._close_locked(line, invert)
+        if serial is None:
+            raise RuntimeError("pyserial недоступен: %s" % SERIAL_ERROR)
+        if not port:
+            raise RuntimeError("не выбран COM-порт внешнего устройства")
+        s = serial.Serial()
+        s.port = port
+        s.baudrate = 9600
+        s.rts = bool(invert) if line in ("RTS", "RTS+DTR") else False   # исходный уровень до open()
+        s.dtr = bool(invert) if line in ("DTR", "RTS+DTR") else False
+        s.open()
+        self.ser, self.port = s, port
+
+    def set(self, on, port, line, invert):
+        """возвращает текст ошибки или None"""
+        with self.lock:
+            try:
+                self._open(port, line, invert)
+                level = bool(on) != bool(invert)
+                if line in ("RTS", "RTS+DTR"):
+                    self.ser.rts = level
+                if line in ("DTR", "RTS+DTR"):
+                    self.ser.dtr = level
+                self.on = bool(on)
+                return None
+            except Exception as ex:
+                self.on = False
+                return "Внешнее устройство: %s" % ex
+
+    def _close_locked(self, line, invert):
+        if self.ser is not None:
+            try:
+                if line in ("RTS", "RTS+DTR"):
+                    self.ser.rts = bool(invert)
+                if line in ("DTR", "RTS+DTR"):
+                    self.ser.dtr = bool(invert)
+                self.ser.close()
+            except Exception:
+                pass
+        self.ser, self.port, self.on = None, "", False
+
+    def close(self, line="RTS+DTR", invert=False):
+        with self.lock:
+            self._close_locked(line, invert)
+
+
 # ============================================================================ ядро
 class Core:
     """Настройки, приём, передача, PTT, звонок. С GUI общается через очередь событий."""
@@ -421,6 +484,9 @@ class Core:
         self.ring_timer = None
         self.ptt = PTT.PttController()
         self.monitor = Monitor()
+        self.ext = ExtControl()
+        self.ext_manual = False
+        self.ext_timer = None
         self.tx_queue = []
         self.transmitting = False
         self.watchdog = None
@@ -565,6 +631,56 @@ class Core:
         if on:
             return self.ptt.key(True)
         return self.ptt.unkey_safe()
+
+    # ---- внешнее устройство
+    def ext_conflict(self):
+        p = self.s.get("ext_port") or ""
+        return bool(p) and self.s["ptt_method"] != "none" and p == self.s["ptt_port"]
+
+    def _ext_set(self, on):
+        if on and self.ext_conflict():
+            self.q.put(("error", "Внешнее устройство: порт %s занят PTT/CAT — выберите другой COM-порт"
+                        % self.s["ext_port"]))
+            return False
+        err = self.ext.set(on, self.s.get("ext_port") or "", self.s.get("ext_line") or "DTR",
+                           bool(self.s.get("ext_invert")))
+        if err:
+            self.q.put(("error", err))
+            return False
+        return True
+
+    def ext_pulse(self, seconds=None):
+        """«1» на линии на заданное время (1…60 с); ручное включение не перебивается."""
+        if self.ext_manual or not self._ext_set(True):
+            return
+        if self.ext_timer is not None:
+            self.ext_timer.cancel()
+        sec = min(60.0, max(1.0, float(seconds or self.s.get("ext_seconds") or 5)))
+
+        def off():
+            if not self.ext_manual:
+                self._ext_set(False)
+        self.ext_timer = threading.Timer(sec, off)
+        self.ext_timer.daemon = True
+        self.ext_timer.start()
+
+    def ext_toggle(self):
+        """кнопка на панели: принудительно включить / выключить"""
+        if self.ext_timer is not None:
+            self.ext_timer.cancel()
+            self.ext_timer = None
+        if self.ext.on:
+            self.ext_manual = False
+            self._ext_set(False)
+        elif self._ext_set(True):
+            self.ext_manual = True
+
+    def ext_reset(self):
+        if self.ext_timer is not None:
+            self.ext_timer.cancel()
+            self.ext_timer = None
+        self.ext_manual = False
+        self.ext.close(self.s.get("ext_line") or "RTS+DTR", bool(self.s.get("ext_invert")))
 
     # ---- самоконтроль
     def apply_monitor(self):
@@ -739,6 +855,7 @@ class Core:
         except Exception:
             pass
         self.ptt.close()
+        self.ext_reset()
         self.stop_ring()
         self.stop_rx()
         self.monitor.close()
@@ -819,6 +936,12 @@ class App:
             self.meter.create_line(x, 0, x, 12, fill="#777")
         self.ch_lbl = ttk.Label(top, text="", width=6)
         self.ch_lbl.pack(side="right")
+        self.btn_ext = ttk.Button(top, text="Внешн.", width=11, command=self.ext_toggle)
+        self.btn_ext.pack(side="right", padx=2)
+        ext_c = tk.Canvas(top, width=14, height=14, highlightthickness=0)
+        ext_c.pack(side="right")
+        self.ext_lamp = ext_c.create_oval(2, 2, 12, 12, fill="#bbb", outline="")
+        self.ext_canvas = ext_c
         lamp = tk.Canvas(top, width=40, height=14, highlightthickness=0)
         lamp.pack(side="right", padx=4)
         self.lamp = lamp.create_oval(2, 2, 12, 12, fill="#bbb", outline="")
@@ -870,6 +993,12 @@ class App:
             text="%d/%d" % (min(len(self.v["msg"].get()), MAX_MSG), MAX_MSG)))
         self.root.bind("<Control-o>", lambda ev: self.open_wav())
         self.root.bind("<Escape>", lambda ev: self.dismiss_ring())
+
+    def ext_toggle(self):
+        if not self.core.s.get("ext_port"):
+            self.add("Внешнее устройство: укажите COM-порт в настройках", "error")
+            return
+        self.core.ext_toggle()
 
     # ---- журнал
     def add(self, text, tag="info", detail=None, sender=None):
@@ -973,6 +1102,8 @@ class App:
             pass
         if self.core.s["ring"]:
             self.core.ring()
+        if self.core.s.get("ext_enabled") and self.core.s.get("ext_port"):
+            self.core.ext_pulse()
         if self.core.s.get("ring_air"):
             # небольшая пауза: вызывающая станция успевает перейти на приём
             frm = c["from"]
@@ -1098,6 +1229,8 @@ class App:
         self.meter.tag_raise("all")
         self.meter.tag_lower(self.meter_bar)
         self.db_lbl.configure(text=("%5.1f дБ" % db) if db > -60 else "  —  дБ")
+        self.ext_canvas.itemconfigure(self.ext_lamp, fill="#f80" if self.core.ext.on else "#bbb")
+        self.btn_ext.configure(text="Внешн. ВКЛ" if self.core.ext_manual else "Внешн.")
         on = self.core.transmitting or self.core.ptt.keyed
         self.lamp_canvas.itemconfigure(self.lamp, fill="#e00" if on else "#bbb")
         self.root.after(100, self.poll)
@@ -1142,6 +1275,11 @@ class SettingsWindow:
             answer_style=tk.StringVar(value=dict(RING_STYLES).get(s.get("answer_style", "kalinka"), RING_STYLES[-1][1])),
             ring_vol=tk.DoubleVar(value=s["ring_volume"]), ring_sec=tk.DoubleVar(value=s["ring_seconds"]),
             ring_air=tk.BooleanVar(value=s.get("ring_air", True)),
+            ext_enabled=tk.BooleanVar(value=s.get("ext_enabled", False)),
+            ext_port=tk.StringVar(value=s.get("ext_port", "")),
+            ext_line=tk.StringVar(value=s.get("ext_line", "DTR")),
+            ext_invert=tk.BooleanVar(value=s.get("ext_invert", False)),
+            ext_sec=tk.DoubleVar(value=s.get("ext_seconds", 5.0)),
         )
         v = self.v
 
@@ -1240,8 +1378,25 @@ class SettingsWindow:
                      width=26).grid(row=5, column=1, **pad)
         ttk.Button(f, text="Прослушать", command=self.test_answer).grid(row=5, column=2, **pad)
 
+        f = ttk.LabelFrame(w, text="Внешнее устройство (отдельный COM-порт, не порт PTT)", padding=6)
+        f.grid(row=4, column=0, columnspan=2, sticky="ew", padx=10, pady=4)
+        ttk.Checkbutton(f, text="Включать при вызове на мой ID", variable=v["ext_enabled"]).grid(
+            row=0, column=0, columnspan=2, **pad)
+        ttk.Label(f, text="COM-порт").grid(row=1, column=0, **pad)
+        self.cb_ext = ttk.Combobox(f, textvariable=v["ext_port"], values=self.ext_ports(), width=12)
+        self.cb_ext.grid(row=1, column=1, **pad)
+        ttk.Label(f, text="Линия").grid(row=1, column=2, **pad)
+        ttk.Combobox(f, textvariable=v["ext_line"], values=EXT_LINES, state="readonly", width=9).grid(
+            row=1, column=3, **pad)
+        ttk.Checkbutton(f, text="Инверсия", variable=v["ext_invert"]).grid(row=1, column=4, **pad)
+        ttk.Label(f, text="Время сигнала, с (1–60)").grid(row=2, column=0, **pad)
+        ttk.Spinbox(f, from_=1, to=60, increment=1, textvariable=v["ext_sec"], width=6).grid(row=2, column=1, **pad)
+        ttk.Button(f, text="Проверить (импульс)", command=self.test_ext).grid(row=2, column=2, columnspan=2, **pad)
+        ttk.Label(f, text="Кнопка «Внешн.» на панели включает выход вручную, пока не нажмёте её снова.",
+                  foreground="#666").grid(row=3, column=0, columnspan=5, **pad)
+
         b = ttk.Frame(w, padding=(10, 8))
-        b.grid(row=4, column=0, columnspan=2, sticky="ew")
+        b.grid(row=5, column=0, columnspan=2, sticky="ew")
         ttk.Button(b, text="Очистить журнал", command=self.clear_log).pack(side="left")
         ttk.Button(b, text="Готово", command=self.close).pack(side="right")
         w.protocol("WM_DELETE_WINDOW", self.close)
@@ -1250,6 +1405,16 @@ class SettingsWindow:
     @staticmethod
     def ports():
         return [d for d, _ in PTT.list_ports()]
+
+    def ext_ports(self):
+        """порты для внешнего устройства — все, кроме порта PTT/CAT"""
+        s = self.app.core.s
+        busy = s["ptt_port"] if s["ptt_method"] != "none" else None
+        return [p for p in self.ports() if p != busy]
+
+    def test_ext(self):
+        self.apply()
+        self.app.core.ext_pulse()
 
     def on_method(self):
         m = next((k for k, t in PTT_TITLES.items() if t == self.v["ptt_method"].get()), "none")
@@ -1296,12 +1461,24 @@ class SettingsWindow:
         s["ring_volume"] = self._num(v["ring_vol"], 0.05, 1.0, 0.5)
         s["ring_seconds"] = self._num(v["ring_sec"], 5, 300, 30)
         s["ring_air"] = bool(v["ring_air"].get())
+        old = (s.get("ext_port"), s.get("ext_line"), s.get("ext_invert"))
+        s["ext_enabled"] = bool(v["ext_enabled"].get())
+        s["ext_port"] = v["ext_port"].get().strip()
+        s["ext_line"] = v["ext_line"].get() if v["ext_line"].get() in EXT_LINES else "DTR"
+        s["ext_invert"] = bool(v["ext_invert"].get())
+        s["ext_seconds"] = self._num(v["ext_sec"], 1, 60, 5)
+        if old != (s["ext_port"], s["ext_line"], s["ext_invert"]):
+            self.app.core.ext.close(old[1] or "RTS+DTR", bool(old[2]))
+            self.app.core.ext_manual = False
         self.app.core.save()
         err = self.app.core.reopen_ptt()
         if err:
             self.app.add("PTT: %s" % err, "error")
         for e in self.app.core.apply_monitor():
             self.app.add("Самоконтроль: %s" % e, "error")
+        if self.app.core.ext_conflict():
+            self.app.add("Внешнее устройство: порт %s занят PTT/CAT — нужен отдельный COM-порт" % s["ext_port"],
+                         "error")
         if s["out_dev"] and s["out_dev"] in s["mon_devs"]:
             self.app.add("Выход на трансивер отмечен в самоконтроле: звук самоконтроля и звонок уйдут в эфир!",
                          "error")
@@ -1393,6 +1570,16 @@ def selftest(out_path):
         good = abs(len(a) / fs_ - want) < 0.02 and np.abs(a).max() <= DEFAULTS["tx_level"] + 0.01
         log("answer on air (kalinka once + PTT delay/tail): %s (%.2f s)" % ("OK" if good else "FAIL", len(a) / fs_))
         ok = ok and good
+    c3 = Core.__new__(Core)
+    c3.s = dict(DEFAULTS, ptt_method="RTS", ptt_port="COM3", ext_port="COM3")
+    c3.q = queue.Queue()
+    c3.ext, c3.ext_manual, c3.ext_timer = ExtControl(), False, None
+    c3.ext_pulse(2)
+    good = c3.ext_conflict() and not c3.ext.on and not c3.q.empty()
+    c3.s["ext_port"] = "COM4"
+    good = good and not c3.ext_conflict()
+    log("external device: separate port enforced: %s" % ("OK" if good else "FAIL"))
+    ok = ok and good
     k = ring_pattern("kalinka", 8000, 0.5)
     melody = (len(k) / 8000.0) - 0.8
     good = abs(melody - 16 * KALINKA_QUARTER) < 0.05 and np.abs(k).max() <= 0.5

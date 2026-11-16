@@ -85,6 +85,15 @@ struct ContentView: View {
             Button { m.refreshDevices() } label: { Image(systemName: "arrow.clockwise") }
                 .help("Обновить список устройств")
             Spacer()
+            Button { m.extToggle() } label: {
+                HStack(spacing: 4) {
+                    Circle().fill(m.extOn ? Color.orange : Color.secondary.opacity(0.3)).frame(width: 10, height: 10)
+                    Text(m.extManual ? "Внешн. ВКЛ" : "Внешн.")
+                }
+            }
+            .help(m.extPort.isEmpty ? "Внешнее устройство: укажите COM-порт в настройках"
+                  : "Внешнее устройство (\(m.extPort), \(m.extLine.rawValue)): включить / выключить вручную")
+            .disabled(m.extPort.isEmpty || m.extPortConflict)
             TxLamp(on: m.transmitting, keyed: m.pttKeyed)
             LevelMeter(level: m.level)
             if m.receiving && m.inputChannels > 1 {
@@ -351,6 +360,40 @@ struct SettingsView: View {
                          ? "На время передачи приём глушится, свой сигнал не декодируется."
                          : "Приём работает и во время передачи; свой сигнал попадёт в журнал как «Своя передача (эхо)».")
                         .font(.caption).foregroundStyle(.secondary)
+                }
+                Section("Внешнее устройство (COM-порт)") {
+                    Toggle("Включать при вызове на мой ID", isOn: $m.extEnabled)
+                    HStack {
+                        Picker("Порт", selection: $m.extPort) {
+                            Text("— не выбран —").tag("")
+                            // порт PTT/CAT в список не входит: внешнее устройство — на отдельном порту
+                            ForEach(m.pttPorts.filter { !(m.pttMethod.usesPort && $0 == m.pttPort) || $0 == m.extPort },
+                                    id: \.self) { Text($0).tag($0) }
+                        }
+                        Button { m.refreshDevices() } label: { Image(systemName: "arrow.clockwise") }
+                    }
+                    Picker("Линия", selection: $m.extLine) {
+                        ForEach(ExtLine.allCases) { Text($0.rawValue).tag($0) }
+                    }
+                    Toggle("Инверсия (активный уровень «0»)", isOn: $m.extInvert)
+                    HStack {
+                        Text("Время сигнала")
+                        Slider(value: $m.extSeconds, in: 1...60, step: 1)
+                        Text(String(format: "%.0f с", m.extSeconds)).monospacedDigit().frame(width: 44)
+                    }
+                    HStack {
+                        Button("Проверить (импульс)") { m.extPulse() }
+                        Button(m.extOn ? "Выключить" : "Включить вручную") { m.extToggle() }
+                    }
+                    .disabled(m.extPort.isEmpty || m.extPortConflict)
+                    if m.extPortConflict {
+                        Text("Этот порт занят PTT/CAT. Для внешнего устройства нужен отдельный COM-порт.")
+                            .font(.caption).foregroundStyle(.red)
+                    } else {
+                        Text("При вызове на ваш ID на линию подаётся «1» на заданное время. Кнопка «Внешн.» "
+                             + "на панели включает выход вручную, пока не нажмёте её снова.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                 }
                 Section("Самоконтроль (можно несколько устройств)") {
                     Toggle("Слушать эфир (вход)", isOn: $m.monitorRX)
