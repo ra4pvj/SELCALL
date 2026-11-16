@@ -374,7 +374,7 @@ struct SettingsView: View {
                 }
                 Section("Звонок при вызове на мой ID") {
                     Toggle("Звонить", isOn: $m.ringEnabled)
-                    Picker("Сигнал", selection: $m.ringStyle) {
+                    Picker("Сигнал звонка", selection: $m.ringStyle) {
                         ForEach(RingStyle.allCases) { Text($0.title).tag($0) }
                     }
                     HStack {
@@ -387,10 +387,17 @@ struct SettingsView: View {
                         Spacer()
                         Stepper(String(format: "%.0f с", m.ringSeconds), value: $m.ringSeconds, in: 5...300, step: 5)
                     }
-                    Toggle("Звонок в эфир — ответ вызывающей станции (как CODAN / Vertex)", isOn: $m.ringOnAir)
+                    Toggle("Ответ в эфир — вызывающая станция слышит, что вызов принят (как CODAN / Vertex)", isOn: $m.ringOnAir)
                     if m.ringOnAir {
-                        Text("Через 1 с после принятого вызова передатчик включается ровно на 5 с и передаёт звонок "
-                             + "с уровнем передачи. На подтверждения (ACK) не отвечает.")
+                        HStack {
+                            Picker("Сигнал ответа в эфир", selection: $m.answerStyle) {
+                                ForEach(RingStyle.allCases) { Text($0.title).tag($0) }
+                            }
+                            Button("Прослушать") { m.testAnswer() }
+                                .help("Проиграть ответ на устройствах самоконтроля (не в эфир)")
+                        }
+                        Text("Через 1 с после принятого вызова сигнал ответа один раз уходит в эфир (мелодия целиком "
+                             + "≈ 2,9 с, тоны 2,5 с) с уровнем передачи. На подтверждения (ACK) не отвечает.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     Text(m.monitorDevices.isEmpty ? "Звонок звучит на системном выходе Mac."

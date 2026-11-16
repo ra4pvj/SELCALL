@@ -51,6 +51,8 @@ final class AppModel: ObservableObject {
     // звонок
     @Published var ringEnabled: Bool { didSet { defaults.set(ringEnabled, forKey: "ringEnabled") } }
     @Published var ringStyle: RingStyle { didSet { defaults.set(ringStyle.rawValue, forKey: "ringStyle") } }
+    /// Сигнал ответа в эфир — выбирается отдельно от звонка.
+    @Published var answerStyle: RingStyle { didSet { defaults.set(answerStyle.rawValue, forKey: "answerStyle") } }
     // самоконтроль: эфир и своя передача на одно или несколько устройств
     @Published var monitorDevices: [String] { didSet { defaults.set(monitorDevices, forKey: "monDevs"); applyMonitor() } }
     @Published var monitorRX: Bool { didSet { defaults.set(monitorRX, forKey: "monRX"); applyMonitor() } }
@@ -60,8 +62,6 @@ final class AppModel: ObservableObject {
     @Published var ringSeconds: Double { didSet { defaults.set(ringSeconds, forKey: "ringSeconds") } }
     /// Ответный звонок в эфир (как у CODAN / Vertex): вызывающая станция слышит, что вызов принят.
     @Published var ringOnAir: Bool { didSet { defaults.set(ringOnAir, forKey: "ringOnAir") } }
-    /// Сколько всего держится передача при ответном звонке (PTT, вместе с задержкой и хвостом).
-    static let ringOnAirSeconds = 5.0
     @Published var transliterate: Bool { didSet { defaults.set(transliterate, forKey: "translit") } }
     @Published var autoAFC: Bool { didSet { defaults.set(autoAFC, forKey: "autoAFC"); applyCenter() } }
     @Published var fixedCenter: Double { didSet { defaults.set(fixedCenter, forKey: "fixedCenter"); applyCenter() } }
@@ -127,6 +127,7 @@ final class AppModel: ObservableObject {
         muteRxOnTx = defaults.object(forKey: "muteRxOnTx") as? Bool ?? true
         ringEnabled = defaults.object(forKey: "ringEnabled") as? Bool ?? true
         ringStyle = RingStyle(rawValue: defaults.string(forKey: "ringStyle") ?? "") ?? .codan
+        answerStyle = RingStyle(rawValue: defaults.string(forKey: "answerStyle") ?? "") ?? .kalinka
         ringVolume = defaults.object(forKey: "ringVolume") as? Double ?? 0.5
         ringSeconds = defaults.object(forKey: "ringSeconds") as? Double ?? 30
         ringOnAir = defaults.object(forKey: "ringOnAir") as? Bool ?? true
@@ -237,6 +238,11 @@ final class AppModel: ObservableObject {
 
     func testRing() {
         ringer.start(style: ringStyle, devices: monitorDeviceIDs, volume: ringVolume, seconds: 4)
+    }
+
+    /// Прослушать сигнал ответа (на устройствах самоконтроля, не в эфир).
+    func testAnswer() {
+        ringer.start(style: answerStyle, devices: monitorDeviceIDs, volume: ringVolume, seconds: 4, once: true)
     }
 
     // MARK: приём
@@ -380,25 +386,17 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Ответный звонок в эфир: тот же сигнал, что и местный звонок; передача ровно 5 с
-    /// (задержка PTT + звонок + хвост), конец звонка плавно гасится.
+    /// Ответ в эфир: сигнал ответа (выбирается отдельно от звонка) звучит один раз —
+    /// мелодия целиком (~2,9 с) или тоны 2,5 с; передача = задержка PTT + сигнал + хвост.
     func sendRingOnAir(to: String) {
         guard ensureTx() else { return }
         let rate = audio.outputRate
-        let total = Int(Self.ringOnAirSeconds * rate)
-        let lead = min(Int(pttDelay * rate), total / 2)
-        let tail = min(Int(pttTail * rate), total / 4)
-        let ringLen = max(0, total - lead - tail)
-        let one = Ringer.pattern(ringStyle, fs: rate, volume: txLevel)
-        var ring = [Float]()
-        ring.reserveCapacity(ringLen)
-        while ring.count < ringLen && !one.isEmpty { ring += one.prefix(ringLen - ring.count) }
-        let fade = min(ring.count, Int(0.02 * rate))
-        for i in 0..<fade { ring[ring.count - 1 - i] *= Float(i) / Float(max(1, fade)) }
-        let y = [Float](repeating: 0, count: lead) + ring + [Float](repeating: 0, count: tail)
+        let y = [Float](repeating: 0, count: Int(pttDelay * rate))
+            + Ringer.answer(answerStyle, fs: rate, volume: txLevel)
+            + [Float](repeating: 0, count: Int(pttTail * rate))
         let entry = LogEntry(date: Date(), kind: .tx, from: Selcall.digitsOnly(myID), to: Selcall.digitsOnly(to),
-                             title: "Звонок в эфир", text: "",
-                             detail: String(format: "%.1f с · %@", Double(y.count) / rate, ringStyle.title), ok: true)
+                             title: "Ответ в эфир", text: "",
+                             detail: String(format: "%.1f с · %@", Double(y.count) / rate, answerStyle.title), ok: true)
         txQueue.append((y, entry))
         if !transmitting { playNext() }
     }

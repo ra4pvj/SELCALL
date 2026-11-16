@@ -21,11 +21,10 @@ enum RingStyle: String, CaseIterable, Identifiable {
 
 /// Начало припева «Калинки» (И. Ларионов, 1860; общественное достояние) по нотам, на октаву выше
 /// записи: «ми ре си до ре си до ре до си ля» — E5 | D5 B4 C5 | D5 B4 C5 | D5 C5 B4 | A4.
-/// (частота, Гц; длительность в четвертях, как в нотах: половинная = 2). 16 четвертей по 0,25 с = 4 с —
-/// фраза целиком укладывается в 5 с ответа в эфир.
+/// (частота, Гц; длительность в четвертях, как в нотах: половинная = 2). 16 четвертей по 0,18 с ≈ 2,9 с.
 enum Kalinka {
     static let E5 = 659.26, D5 = 587.33, C5 = 523.25, B4 = 493.88, A4 = 440.0
-    static let quarter = 0.25
+    static let quarter = 0.18
     static let notes: [(Double, Double)] = [
         (E5, 2),
         (D5, 2), (B4, 1), (C5, 1),
@@ -41,6 +40,25 @@ final class Ringer {
     private var engines: [AVAudioEngine] = []
     private var stopWork: DispatchWorkItem?
     var ringing: Bool { !engines.isEmpty }
+
+    /// Длительность сигнала ответа в эфир для звонков-«тонов» (мелодия звучит целиком один раз).
+    static let answerSeconds = 2.5
+
+    /// Сигнал ответа в эфир: мелодия — один раз без паузы; остальные сигналы — 2,5 с, конец плавно гасится.
+    static func answer(_ style: RingStyle, fs: Double, volume: Double) -> [Float] {
+        var x = pattern(style, fs: fs, volume: volume)
+        if style == .kalinka {
+            x.removeLast(min(x.count, Int(0.8 * fs)))              // без паузы после фразы
+            return x
+        }
+        let n = Int(answerSeconds * fs)
+        var out = [Float]()
+        out.reserveCapacity(n)
+        while out.count < n && !x.isEmpty { out += x.prefix(n - out.count) }
+        let fade = min(out.count, Int(0.02 * fs))
+        for i in 0..<fade { out[out.count - 1 - i] *= Float(i) / Float(max(1, fade)) }
+        return out
+    }
 
     /// Один период звонка (сигнал + пауза), моно.
     static func pattern(_ style: RingStyle, fs: Double, volume: Double) -> [Float] {
@@ -87,7 +105,8 @@ final class Ringer {
         return out
     }
 
-    func start(style: RingStyle, devices: [AudioDeviceID], volume: Double, seconds: Double) {
+    /// Звонить по кругу до `seconds` секунд; `once` — проиграть один раз сигнал ответа (прослушивание).
+    func start(style: RingStyle, devices: [AudioDeviceID], volume: Double, seconds: Double, once: Bool = false) {
         stop()
         for dev in (devices.isEmpty ? [AudioDeviceID(0)] : devices) {
             let e = AVAudioEngine()
@@ -103,7 +122,7 @@ final class Ringer {
                 if let f = fmt { e.connect(p, to: e.mainMixerNode, format: f) }
             }
             guard err == nil, let f = fmt else { continue }
-            let x = Ringer.pattern(style, fs: fs, volume: volume)
+            let x = once ? Ringer.answer(style, fs: fs, volume: volume) : Ringer.pattern(style, fs: fs, volume: volume)
             guard let buf = AVAudioPCMBuffer(pcmFormat: f, frameCapacity: AVAudioFrameCount(x.count)),
                   let ch = buf.floatChannelData else { continue }
             buf.frameLength = AVAudioFrameCount(x.count)
@@ -112,7 +131,7 @@ final class Ringer {
             _ = ObjCSafe.run {
                 e.prepare()
                 guard (try? e.start()) != nil else { return }
-                p.scheduleBuffer(buf, at: nil, options: [.loops], completionHandler: nil)
+                p.scheduleBuffer(buf, at: nil, options: once ? [] : [.loops], completionHandler: nil)
                 p.play()
                 ok = true
             }

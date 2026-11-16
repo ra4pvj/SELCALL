@@ -45,7 +45,7 @@ except Exception:
     pass
 
 RX_FS = 8000
-RING_AIR_SECONDS = 5.0      # ответный звонок в эфир: передача ровно 5 с (вместе с задержкой PTT и хвостом)
+ANSWER_SECONDS = 2.5        # ответ в эфир тонами: 2,5 с (мелодия звучит целиком один раз)
 MAX_MSG = S.MAX_MSG
 
 
@@ -76,7 +76,7 @@ DEFAULTS = dict(
     ptt_icom_model="IC-7300", ptt_icom_addr="94", ptt_kenwood="TX;",
     ptt_delay=0.5, ptt_tail=0.3, mute_rx_on_tx=True,
     mon_devs=[], mon_rx=True, mon_tx=True, mon_level=0.5,
-    ring=True, ring_style="codan", ring_volume=0.5, ring_seconds=30.0,
+    ring=True, ring_style="codan", answer_style="kalinka", ring_volume=0.5, ring_seconds=30.0,
     ring_air=True,
 )
 
@@ -89,10 +89,9 @@ RING_STYLES = [("codan", "Двухтональный (как CODAN)"), ("vertex"
 
 # Начало припева «Калинки» (И. Ларионов, 1860; общественное достояние) по нотам, на октаву выше записи:
 # «ми ре си до ре си до ре до си ля» — E5 | D5 B4 C5 | D5 B4 C5 | D5 C5 B4 | A4
-# (частота, Гц; длительность в четвертях, как в нотах: половинная = 2). 16 четвертей по 0,25 с = 4 с —
-# фраза целиком укладывается в 5 с ответа в эфир.
+# (частота, Гц; длительность в четвертях, как в нотах: половинная = 2). 16 четвертей по 0,18 с ≈ 2,9 с.
 _E5, _D5, _C5, _B4, _A4 = 659.26, 587.33, 523.25, 493.88, 440.0
-KALINKA_QUARTER = 0.25
+KALINKA_QUARTER = 0.18
 KALINKA = [(_E5, 2),
            (_D5, 2), (_B4, 1), (_C5, 1),
            (_D5, 2), (_B4, 1), (_C5, 1),
@@ -250,6 +249,19 @@ def output_rate(device):
         return int(sd.query_devices(device if device is not None else sd.default.device[1])["default_samplerate"])
     except Exception:
         return 48000
+
+
+def answer_pattern(style, fs, volume):
+    """Сигнал ответа в эфир: мелодия — один раз без паузы; тоны — 2,5 с, конец плавно гасится."""
+    x = ring_pattern(style, fs, volume)
+    if style == "kalinka":
+        return x[:max(0, len(x) - int(0.8 * fs))]
+    n = int(ANSWER_SECONDS * fs)
+    y = np.tile(x, n // len(x) + 1)[:n].copy()
+    f = min(n, int(0.02 * fs))
+    if f:
+        y[-f:] *= np.linspace(1, 0, f)
+    return y.astype(np.float32)
 
 
 def ring_pattern(style, fs, volume):
@@ -589,23 +601,17 @@ class Core:
         return None
 
     def send_ring(self, to_id):
-        """Ответный звонок в эфир (как CODAN / Vertex): передача ровно 5 с — задержка PTT,
-        звонковый сигнал, хвост; конец звонка плавно гасится."""
+        """Ответ в эфир (как CODAN / Vertex): сигнал ответа (отдельный от звонка) звучит один раз —
+        мелодия целиком (~2,9 с) или тоны 2,5 с; передача = задержка PTT + сигнал + хвост."""
         if sd is None:
             return "Звуковая библиотека недоступна: %s" % SD_ERROR
         dev = device_index(self.s["out_dev"], "out")
         fs = output_rate(dev)
-        total = int(RING_AIR_SECONDS * fs)
-        nl = min(int(float(self.s["ptt_delay"]) * fs), total // 2)
-        nt = min(int(float(self.s["ptt_tail"]) * fs), total // 4)
-        n = max(0, total - nl - nt)
-        one = ring_pattern(self.s["ring_style"], fs, float(self.s["tx_level"]))
-        ring = np.tile(one, n // len(one) + 1)[:n].copy()
-        f = min(n, int(0.02 * fs))
-        if f:
-            ring[-f:] *= np.linspace(1, 0, f)
-        audio = np.concatenate((np.zeros(nl), ring, np.zeros(nt))).astype(np.float32)
-        self.tx_queue.append((audio, fs, dev, digits(self.s["my_id"]), digits(to_id), "", "Звонок в эфир"))
+        sig = answer_pattern(self.s.get("answer_style", "kalinka"), fs, float(self.s["tx_level"]))
+        nl = int(float(self.s["ptt_delay"]) * fs)
+        nt = int(float(self.s["ptt_tail"]) * fs)
+        audio = np.concatenate((np.zeros(nl), sig, np.zeros(nt))).astype(np.float32)
+        self.tx_queue.append((audio, fs, dev, digits(self.s["my_id"]), digits(to_id), "", "Ответ в эфир"))
         if not self.transmitting:
             self._play_next()
         return None
@@ -683,7 +689,8 @@ class Core:
         t.start()
 
     # ---- звонок
-    def ring(self, seconds=None):
+    def ring(self, seconds=None, answer=False):
+        """Звонок по кругу; answer=True — один раз проиграть сигнал ответа (прослушивание, не в эфир)."""
         if sd is None:
             return
         self.stop_ring()
@@ -691,10 +698,13 @@ class Core:
         for n in names:
             dev = device_index(n, "out") if n else None
             fs = output_rate(dev)
-            pat = ring_pattern(self.s["ring_style"], fs, float(self.s["ring_volume"]))
+            if answer:
+                pat = answer_pattern(self.s.get("answer_style", "kalinka"), fs, float(self.s["ring_volume"]))
+            else:
+                pat = ring_pattern(self.s["ring_style"], fs, float(self.s["ring_volume"]))
             pl = Player()
             try:
-                pl.play(pat, fs, dev, loop=True)
+                pl.play(pat, fs, dev, loop=not answer)
                 self.ring_players.append(pl)
             except Exception as ex:
                 self.q.put(("error", "Звонок (%s): %s" % (n or "системный выход", ex)))
@@ -1129,6 +1139,7 @@ class SettingsWindow:
             in_channel=tk.StringVar(value=IN_CHANNELS[int(s.get("in_channel") or 0)]),
             ring=tk.BooleanVar(value=s["ring"]),
             ring_style=tk.StringVar(value=dict(RING_STYLES).get(s["ring_style"], RING_STYLES[0][1])),
+            answer_style=tk.StringVar(value=dict(RING_STYLES).get(s.get("answer_style", "kalinka"), RING_STYLES[-1][1])),
             ring_vol=tk.DoubleVar(value=s["ring_volume"]), ring_sec=tk.DoubleVar(value=s["ring_seconds"]),
             ring_air=tk.BooleanVar(value=s.get("ring_air", True)),
         )
@@ -1214,7 +1225,7 @@ class SettingsWindow:
         f.grid(row=2, column=1, rowspan=2, sticky="nsew", padx=10, pady=4)
         ttk.Checkbutton(f, text="Звонить (на устройствах самоконтроля,\nесли не выбраны — системный выход)",
                         variable=v["ring"]).grid(row=0, column=0, columnspan=3, **pad)
-        ttk.Label(f, text="Сигнал").grid(row=1, column=0, **pad)
+        ttk.Label(f, text="Сигнал звонка").grid(row=1, column=0, **pad)
         ttk.Combobox(f, textvariable=v["ring_style"], values=[t for _, t in RING_STYLES], state="readonly",
                      width=26).grid(row=1, column=1, columnspan=2, **pad)
         ttk.Label(f, text="Громкость").grid(row=2, column=0, **pad)
@@ -1222,8 +1233,12 @@ class SettingsWindow:
         ttk.Button(f, text="Прослушать", command=self.test_ring).grid(row=2, column=2, **pad)
         ttk.Label(f, text="Не дольше, с").grid(row=3, column=0, **pad)
         ttk.Spinbox(f, from_=5, to=300, increment=5, textvariable=v["ring_sec"], width=6).grid(row=3, column=1, **pad)
-        ttk.Checkbutton(f, text="Звонок в эфир — ответ вызывающей станции\n(как CODAN / Vertex: передача 5 с, уровень передачи)",
+        ttk.Checkbutton(f, text="Ответ в эфир — вызывающая станция слышит, что вызов\nпринят (как CODAN / Vertex; один раз, уровень передачи)",
                         variable=v["ring_air"]).grid(row=4, column=0, columnspan=3, **pad)
+        ttk.Label(f, text="Сигнал ответа").grid(row=5, column=0, **pad)
+        ttk.Combobox(f, textvariable=v["answer_style"], values=[t for _, t in RING_STYLES], state="readonly",
+                     width=26).grid(row=5, column=1, **pad)
+        ttk.Button(f, text="Прослушать", command=self.test_answer).grid(row=5, column=2, **pad)
 
         b = ttk.Frame(w, padding=(10, 8))
         b.grid(row=4, column=0, columnspan=2, sticky="ew")
@@ -1277,6 +1292,7 @@ class SettingsWindow:
         s["in_channel"] = IN_CHANNELS.index(v["in_channel"].get()) if v["in_channel"].get() in IN_CHANNELS else 0
         s["ring"] = bool(v["ring"].get())
         s["ring_style"] = next((k for k, t in RING_STYLES if t == v["ring_style"].get()), "codan")
+        s["answer_style"] = next((k for k, t in RING_STYLES if t == v["answer_style"].get()), "kalinka")
         s["ring_volume"] = self._num(v["ring_vol"], 0.05, 1.0, 0.5)
         s["ring_seconds"] = self._num(v["ring_sec"], 5, 300, 30)
         s["ring_air"] = bool(v["ring_air"].get())
@@ -1297,6 +1313,10 @@ class SettingsWindow:
     def test_ring(self):
         self.apply()
         self.app.core.ring(seconds=4)
+
+    def test_answer(self):
+        self.apply()
+        self.app.core.ring(seconds=4, answer=True)
 
     def clear_log(self):
         t = self.app.text
@@ -1369,12 +1389,13 @@ def selftest(out_path):
         c2.send_ring("1111")
         a = c2.tx_queue[0][0] if c2.tx_queue else np.zeros(0)
         fs_ = c2.tx_queue[0][1] if c2.tx_queue else 48000
-        good = abs(len(a) / fs_ - RING_AIR_SECONDS) < 0.01 and abs(float(np.abs(a).max()) - DEFAULTS["tx_level"]) < 0.01
-        log("ring on air (5 s total, TX level): %s (%.2f s)" % ("OK" if good else "FAIL", len(a) / fs_))
+        want = 16 * KALINKA_QUARTER + DEFAULTS["ptt_delay"] + DEFAULTS["ptt_tail"]
+        good = abs(len(a) / fs_ - want) < 0.02 and np.abs(a).max() <= DEFAULTS["tx_level"] + 0.01
+        log("answer on air (kalinka once + PTT delay/tail): %s (%.2f s)" % ("OK" if good else "FAIL", len(a) / fs_))
         ok = ok and good
     k = ring_pattern("kalinka", 8000, 0.5)
     melody = (len(k) / 8000.0) - 0.8
-    good = abs(melody - 4.0) < 0.05 and np.abs(k).max() <= 0.5
+    good = abs(melody - 16 * KALINKA_QUARTER) < 0.05 and np.abs(k).max() <= 0.5
     log("kalinka melody: %s (%.2f s + pause)" % ("OK" if good else "FAIL", melody))
     ok = ok and good
     pat = ring_pattern("codan", 48000, 0.5)
